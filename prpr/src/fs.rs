@@ -304,97 +304,133 @@ fn info_from_csv(text: &str) -> Result<ChartInfo> {
     )
 }
 
+const CHART_EXTS: &[&str] = &["json", "pec"];
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "gif", "webp", "avif", "ppm"];
+const AUDIO_EXTS: &[&str] = &["mp3", "ogg", "wav", "flac", "aac", "m4a"];
+const INFO_EXTS: &[&str] = &["yml", "yaml"];
+
+fn extension_of(file: &str) -> Option<String> {
+    file.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase())
+}
+
+/// `extra.json` is chart metadata, not a chart itself.
+fn is_chart_auxiliary(file: &str) -> bool {
+    file.eq_ignore_ascii_case("extra.json")
+}
+
+/// Exactly one candidate is fine, none means "not found", more than one is an
+/// error: a chart root must not be ambiguous.
+fn pick_unique(desc: &str, mut candidates: Vec<String>) -> Result<Option<String>> {
+    candidates.sort();
+    candidates.dedup();
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.pop()),
+        n => bail!(
+            "found {n} candidate {desc} files ({}); expected exactly one - \
+             rename or remove the extras, or name the file to use in info.yml",
+            candidates.join(", ")
+        ),
+    }
+}
+
+async fn find_unique_ext(fs: &mut dyn FileSystem, desc: &str, exts: &[&str], keep: impl Fn(&str) -> bool) -> Result<Option<String>> {
+    let files = fs.list_root().context("cannot list files")?;
+    let candidates = files
+        .into_iter()
+        .filter(|file| keep(file))
+        .filter(|file| extension_of(file).is_some_and(|ext| exts.contains(&ext.as_str())))
+        .collect();
+    pick_unique(desc, candidates)
+}
+
+async fn resolve_media(fs: &mut dyn FileSystem, info: &mut ChartInfo, meta_music: Option<String>, meta_illustration: Option<String>) -> Result<()> {
+    if !fs.exists(&info.music).await? {
+        if let Some(name) = meta_music.filter(|it| !it.is_empty()) {
+            if fs.exists(&name).await? {
+                info.music = name;
+            }
+        }
+    }
+    if !fs.exists(&info.music).await? {
+        if let Some(name) = find_unique_ext(fs, "audio", AUDIO_EXTS, |_| true).await? {
+            info.music = name;
+        }
+    }
+
+    if !fs.exists(&info.illustration).await? {
+        if let Some(name) = meta_illustration.filter(|it| !it.is_empty()) {
+            if fs.exists(&name).await? {
+                info.illustration = name;
+            }
+        }
+    }
+    if !fs.exists(&info.illustration).await? {
+        if let Some(name) = find_unique_ext(fs, "illustration", IMAGE_EXTS, |_| true).await? {
+            info.illustration = name;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve file names for an info file read from disk: keep a declared name
+/// when that file exists, otherwise accept the only file with a matching
+/// extension. Ambiguity (>1 match) is reported instead of silently picking one.
+pub async fn resolve_files(fs: &mut dyn FileSystem, info: &mut ChartInfo) -> Result<()> {
+    if !fs.exists(&info.chart).await? {
+        if let Some(chart) = find_unique_ext(fs, "chart", CHART_EXTS, |file| !is_chart_auxiliary(file)).await? {
+            info.chart = chart;
+        }
+    }
+    resolve_media(fs, info, None, None).await
+}
+
 pub async fn fix_info(fs: &mut dyn FileSystem, info: &mut ChartInfo) -> Result<()> {
-    async fn get(fs: &mut dyn FileSystem, path: &mut String) -> Result<Option<String>> {
-        Ok(if fs.exists(path).await? { Some(std::mem::take(path)) } else { None })
+    if !fs.exists(&info.chart).await? {
+        let chart = find_unique_ext(fs, "chart", CHART_EXTS, |file| !is_chart_auxiliary(file))
+            .await?
+            .ok_or_else(|| anyhow!("cannot find chart (*.json or *.pec)"))?;
+        info.chart = chart;
     }
-    let mut chart = get(fs, &mut info.chart).await?;
-    let mut music = get(fs, &mut info.music).await?;
-    let mut illustration = get(fs, &mut info.illustration).await?;
-    fn put(desc: &str, status: &mut Option<String>, value: String) {
-        if status.as_ref() == Some(&value) {
-            return;
-        }
-        if status.is_some() {
-            warn!("found multiple {}, using the first one", desc);
-        } else {
-            *status = Some(value);
-        }
-    }
-    for file in fs.list_root().context("cannot list files")? {
-        if let Some((_, ext)) = file.rsplit_once('.') {
-            match ext.to_ascii_lowercase().as_str() {
-                "json" | "pec" => {
-                    put("charts", &mut chart, file);
-                }
-                _ => {}
-            }
-        }
-    }
-    if let Some(chart) = &chart {
-        info.chart = chart.to_owned();
-        if let Ok(bytes) = fs.load_file(&info.chart).await {
-            if let Ok((mut value, _s)) = tokio::task::spawn_blocking(move || {
-                let s = String::from_utf8(bytes)?;
-                let json: serde_json::Value = serde_json::from_str(&s)?;
-                Ok::<_, anyhow::Error>((json, s))
-            })
-                .await?
-            {
-                #[derive(Deserialize)]
-                struct RPEMeta {
-                    name: String,
-                    level: String,
-                    background: String,
-                    charter: String,
-                    composer: Option<String>,
-                    illustrator: Option<String>,
-                    song: String,
-                }
 
-                if let Ok(meta) = serde_json::from_value::<RPEMeta>(value["META"].take()) {
-                    info.name = meta.name;
-                    infer_diff(info, &meta.level);
-                    info.level = meta.level;
-                    info.charter = meta.charter;
-                    if let Some(val) = meta.composer {
-                        info.composer = val;
-                    }
-                    if let Some(val) = meta.illustrator {
-                        info.illustrator = val;
-                    }
-                    if illustration.is_none() {
-                        illustration = get(fs, &mut meta.background.clone()).await?;
-                    }
-                    if music.is_none() {
-                        music = get(fs, &mut meta.song.clone()).await?;
-                    }
-                }
+    let mut meta_music = None;
+    let mut meta_illustration = None;
+    if let Ok(bytes) = fs.load_file(&info.chart).await {
+        if let Ok((mut value, _s)) = tokio::task::spawn_blocking(move || {
+            let s = String::from_utf8(bytes)?;
+            let json: serde_json::Value = serde_json::from_str(&s)?;
+            Ok::<_, anyhow::Error>((json, s))
+        })
+        .await?
+        {
+            #[derive(Deserialize)]
+            struct RPEMeta {
+                name: String,
+                level: String,
+                background: String,
+                charter: String,
+                composer: Option<String>,
+                illustrator: Option<String>,
+                song: String,
             }
-        }
 
-    } else {
-        bail!("cannot find chart");
-    }
-    for file in fs.list_root().context("cannot list files")? {
-        if let Some((_, ext)) = file.rsplit_once('.') {
-            match ext.to_ascii_lowercase().as_str() {
-                "mp3" | "ogg" | "wav" | "flac" | "aac" => {
-                    put("music files", &mut music, file);
+            if let Ok(meta) = serde_json::from_value::<RPEMeta>(value["META"].take()) {
+                info.name = meta.name;
+                infer_diff(info, &meta.level);
+                info.level = meta.level;
+                info.charter = meta.charter;
+                if let Some(val) = meta.composer {
+                    info.composer = val;
                 }
-                "png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp" | "avif" | "ppm" => {
-                    put("illustrations", &mut illustration, file);
+                if let Some(val) = meta.illustrator {
+                    info.illustrator = val;
                 }
-                _ => {}
+                meta_illustration = Some(meta.background);
+                meta_music = Some(meta.song);
             }
         }
     }
-    if let Some(music) = music {
-        info.music = music;
-    }
-    if let Some(illustration) = illustration {
-        info.illustration = illustration;
-    }
+    resolve_media(fs, info, meta_music, meta_illustration).await?;
     Ok(())
 }
 
@@ -421,15 +457,24 @@ pub async fn load_info(fs: &mut dyn FileSystem) -> Result<ChartInfo> {
         }
     }
 
-    let info = match info_opt {
-        Some(info) => info,
-        None => {
-            warn!("none of info.yml, info.txt and info.csv is found, inferring");
-            let mut info = ChartInfo::default();
-            fix_info(fs, &mut info).await?;
-            info
+    // Nothing explicitly named: accept the only *.yml / *.yaml in the root,
+    // whatever it is called. More than one is ambiguous, not "pick the first".
+    if info_opt.is_none() {
+        if let Some(name) = find_unique_ext(fs, "description", INFO_EXTS, |_| true).await? {
+            let bytes = fs.load_file(&name).await?;
+            let text = bytes_to_text_auto(&bytes);
+            info_opt = Some(serde_yaml::from_str(&text)?);
         }
-    };
+    }
+
+    let inferred = info_opt.is_none();
+    let mut info = info_opt.unwrap_or_default();
+    if inferred {
+        warn!("none of info.yml, info.txt and info.csv is found, inferring");
+        fix_info(fs, &mut info).await?;
+    } else {
+        resolve_files(fs, &mut info).await?;
+    }
     Ok(info)
 }
 

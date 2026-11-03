@@ -3707,15 +3707,39 @@ dependencies = [
 [[package]]
 name = "macroquad"
 version = "0.3.25"
+source = "git+https://github.com/CMDBookDevelope/prpr-macroquad#7576b11c58bfafaab7ef539c0a2d43ce492d7ff0"
+dependencies = [
+ "bumpalo",
+ "fontdue",
+ "glam 0.30.10",
+ "image 0.25.10",
+ "macroquad_macro 0.1.7 (git+https://github.com/CMDBookDevelope/prpr-macroquad)",
+ "miniquad 0.3.15 (git+https://github.com/CMDBookDevelope/prpr-miniquad)",
+ "quad-rand",
+]
+
+[[package]]
+name = "macroquad"
+version = "0.3.25"
 source = "git+https://github.com/Winamin/prpr-macroquad#800b4d8c9a0b166f6de83149006e7d4a5fe0e54e"
 dependencies = [
  "bumpalo",
  "fontdue",
  "glam 0.30.10",
  "image 0.25.10",
- "macroquad_macro",
- "miniquad",
+ "macroquad_macro 0.1.7 (git+https://github.com/Winamin/prpr-macroquad)",
+ "miniquad 0.3.15 (git+https://github.com/Winamin/prpr-miniquad)",
  "quad-rand",
+]
+
+[[package]]
+name = "macroquad_macro"
+version = "0.1.7"
+source = "git+https://github.com/CMDBookDevelope/prpr-macroquad#7576b11c58bfafaab7ef539c0a2d43ce492d7ff0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3851,6 +3875,37 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
+name = "miniquad"
+version = "0.3.15"
+source = "git+https://github.com/CMDBookDevelope/prpr-miniquad#e70f78198132254258f1e1f7f568f488b346d110"
+dependencies = [
+ "ash 0.37.3+1.3.251",
+ "ash-window",
+ "gpu-allocator 0.26.0",
+ "keyboard-types",
+ "libc",
+ "napi-build-ohos",
+ "napi-derive-ohos",
+ "napi-ohos",
+ "ndk-context",
+ "ndk-sys 0.2.2",
+ "objc",
+ "ohos-hilog-binding",
+ "ohos-ime-binding",
+ "ohos-input-sys",
+ "ohos-sys-opaque-types",
+ "ohos-xcomponent-binding",
+ "ohos-xcomponent-sys",
+ "ohos_enum_macro 0.0.2",
+ "raw-window-handle 0.5.2",
+ "raw-window-handle 0.6.2",
+ "rayon",
+ "shaderc",
+ "winapi",
+ "xcomponent-sys",
+]
 
 [[package]]
 name = "miniquad"
@@ -5122,7 +5177,7 @@ dependencies = [
  "logos",
  "lru",
  "lyon",
- "macroquad",
+ "macroquad 0.3.25 (git+https://github.com/Winamin/prpr-macroquad)",
  "md5",
  "nalgebra",
  "ndk-context",
@@ -5168,7 +5223,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "log",
- "macroquad",
+ "macroquad 0.3.25 (git+https://github.com/Winamin/prpr-macroquad)",
  "phira-mp-client",
  "phira-mp-common",
  "pretty_env_logger",
@@ -5494,9 +5549,9 @@ dependencies = [
  "libc",
  "lru",
  "lyon",
- "macroquad",
+ "macroquad 0.3.25 (git+https://github.com/CMDBookDevelope/prpr-macroquad)",
  "memmap2",
- "miniquad",
+ "miniquad 0.3.15 (git+https://github.com/CMDBookDevelope/prpr-miniquad)",
  "miniz_oxide 0.7.4",
  "naga",
  "nalgebra",
