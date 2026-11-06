@@ -463,7 +463,9 @@ fn rebuild(effect: &mut Effect, zones: &[Zone], aspect: f32, grid_w: usize, grid
                                     .clamp(0, grid_h as i64 - 1) as usize;
                                 let idx = syi * grid_w + sxi;
                                 row_out[x] = compose_active[idx];
-                                disabled_row[x] = compose_disabled[idx];
+                                // The disabled layer is drawn as the raw block
+                                // rectangle: no noise displacement, no textures.
+                                disabled_row[x] = compose_disabled[y * grid_w + x];
                             }
                         }
                     });
@@ -744,25 +746,14 @@ float chartTime() {
     return uintBitsToFloat(bits);
 }
 
-// Official `disabledColor()`: no edge ring, no glow, just the muted fill.
-vec4 disabledColor(float mask, vec2 fieldUV, float time) {
+// Inactive block area: the plain rectangle, no displacement and no textures.
+vec4 disabledColor(float mask) {
     if (mask < 0.0001) { discard; }
-    vec2 dir = normalize(DISPLACE_DIRECTION);
-    float dt = (time / 20.0) * DISABLED_SPEED;
-    vec2 dispUV = fieldUV * vec2(0.5, 0.2);
-    float d0 = texture(uDisplaceTex, dispUV + dir * dt).x;
-    float d1 = texture(uDisplaceTex, dispUV + vec2(-dir.y, dir.x) * dt).x;
-    float avgD = (d0 + d1) * 0.5;
-    vec2 off = dir * (d0 - 0.5) + vec2(-dir.y, dir.x) * (d1 - 0.5);
-    vec2 sparkUV = off * DISABLED_SPARK_INTENSITY + fieldUV * vec2(3.0, 1.2);
-    float sparkV = texture(uSparkTex, sparkUV).x;
-    vec3 col = avgD * (vec3(sparkV) * DISABLED_SPARK_TINT) * DISABLED_SPARK_OPACITY
-             + DISABLED_FILL_COLOR * DISABLED_FILL_OPACITY;
-    // Slightly washed out: the disabled block should read as a faded version of
-    // the active one (+12% white).
-    col = mix(col, vec3(1.0), 0.12);
-    // Same opacity as the active fill layer, so both states feel like the same
-    // material (the official shader used an opaque 1.0 here).
+    vec3 col = DISABLED_FILL_COLOR * DISABLED_FILL_OPACITY;
+    // Slightly washed out: the disabled block reads as a faded version of the
+    // active one (+9% white).
+    col = mix(col, vec3(1.0), 0.09);
+    // Same opacity as the active fill layer.
     return vec4(mask * col, mask * FILL_OPACITY);
 }
 
@@ -867,7 +858,7 @@ void main() {
     if (activeMask > 0.0001) {
         result = fullActive(uv, chartTime(), screenSize, effectSize);
     } else if (mask.a > 0.0001) {
-        result = disabledColor(mask.a, uv, chartTime());
+        result = disabledColor(mask.a);
     } else {
         discard;
     }
