@@ -10,13 +10,17 @@
 //!     (`BlockCompose` pass, amplitude `0.1`), then upscaled 2x with nearest
 //!     sampling; six 9-grid dilation passes (`GLOW_W`) produce the edge ring
 //!     (`.g`) and the outer glow (`.b`), the fill mask is `.r`;
+//!   * the **disabled layer** (`.a`) is the fill of block areas that are not in
+//!     their active window: the reference's `disabledColor()` keeps the inner
+//!     fill (`uDisabledFillColor * uDisabledFillOpacity`) and drops the edge /
+//!     glow ring, which is what the official game shows before a block turns on;
 //!   * `displace.png` / `spark.png` / `noise.png` are the exact textures the
 //!     reference ships;
 //!   * the fragment shader keeps the official uniforms (`_EdgeColor`,
 //!     `_FillColor`, `_GlowColor`, `_SparkTint`, opacities, displace/spark
 //!     parameters) and the `One / OneMinusSrcAlpha` blend mode;
-//!   * the touch-hover / ready / disabled layers are skipped (`_TouchPosCount`
-//!     is 0 for an offline render), exactly like the reference does.
+//!   * the touch-hover / ready layers are skipped (`_TouchPosCount` is 0 for an
+//!     offline render), exactly like the reference does.
 //!
 //! Chart time is uploaded in a 1x1 RGBA texture (bound to `uNoiseTex`, unused by
 //! the active layer) because macroquad overwrites `_Time` with wall-clock time,
@@ -87,25 +91,38 @@ struct Effect {
     mask: Texture2D,
     displace: Texture2D,
     spark: Texture2D,
-    /// 1x1 RGBA holding the chart time as an `f32` (big-endian byte order in RGBA).
+    /// 1x1 RGBA holding the chart time as an `f32` (little-endian bytes in RGBA).
     clock: Texture2D,
     white: Texture2D,
     grid_w: usize,
     grid_h: usize,
     tex_w: usize,
     tex_h: usize,
-    rgba: Vec<u8>,
-    flags: Vec<u8>,
+    /// Upload buffer; written in place so a frame does not need a 0.5 MB clone.
+    image: Image,
+    /// Copy of the bytes currently uploaded to the GPU (skips redundant uploads).
+    last_upload: Vec<u8>,
+    /// bitset of the active fill (used by the dilation).
     bits: Vec<u64>,
     scratch: Vec<u64>,
+    merge: Vec<u64>,
+    flags_active: Vec<u8>,
+    flags_disabled: Vec<u8>,
+    compose_active: Vec<u8>,
+    compose_disabled: Vec<u8>,
+    fm_active: Vec<u8>,
+    fm_disabled: Vec<u8>,
     noise_r: Vec<u8>,
     noise_w: usize,
     noise_h: usize,
     centered: [f32; 256],
-    fm: Vec<u8>,
-    compose: Vec<u8>,
     seen: u64,
     dumped: u32,
+    build_ms: f64,
+    build_n: u64,
+    last_hash: u64,
+    last_build_time: f32,
+    stage_ms: (f64, f64, f64, f64, f64),
 }
 
 static EFFECT: Lazy<Mutex<Option<Effect>>> = Lazy::new(|| Mutex::new(None));
@@ -206,110 +223,186 @@ fn create() -> Effect {
         grid_h: 1,
         tex_w: 1,
         tex_h: 1,
-        rgba: Vec::new(),
-        flags: Vec::new(),
+        image: Image {
+            width: 1,
+            height: 1,
+            bytes: vec![0; 4],
+        },
+        last_upload: Vec::new(),
         bits: Vec::new(),
         scratch: Vec::new(),
+        merge: Vec::new(),
+        flags_active: Vec::new(),
+        flags_disabled: Vec::new(),
+        compose_active: Vec::new(),
+        compose_disabled: Vec::new(),
+        fm_active: Vec::new(),
+        fm_disabled: Vec::new(),
         noise_r,
         noise_w,
         noise_h,
         centered,
-        fm: Vec::new(),
-        compose: Vec::new(),
         seen: 0,
         dumped: 0,
+        build_ms: 0.,
+        build_n: 0,
+        last_hash: 0,
+        last_build_time: f32::NEG_INFINITY,
+        stage_ms: (0., 0., 0., 0., 0.),
     }
 }
 
-/// Rebuild the RGBA mask for the given zones.
-///
-/// Mirrors `computeMasks()` of the reference:
-///   1. per-cell coverage (`norm` / `subtract`, overwrite semantics),
-///   2. `compose = |norm - subtract-threshold|` (a plain XOR for binary masks),
-///   3. per-cell noise displacement (`BlockCompose` pass 0, amplitude 0.1),
-///   4. 2x nearest upscale + six 9-grid dilation passes.
-fn rebuild(effect: &mut Effect, zones: &[Zone], aspect: f32, grid_w: usize, grid_h: usize, time: f32) {
-    let tex_w = grid_w * 2;
-    let tex_h = grid_h * 2;
-    if effect.tex_w != tex_w || effect.tex_h != tex_h {
-        effect.tex_w = tex_w;
-        effect.tex_h = tex_h;
-        effect.rgba = vec![0u8; tex_w * tex_h * 4];
-        effect.bits = vec![0u64; tex_w.div_ceil(64) * tex_h];
-        effect.scratch = vec![0u64; effect.bits.len()];
-        effect.mask = Texture2D::from_rgba8(tex_w as u16, tex_h as u16, &effect.rgba);
-        effect.material.set_texture("uMasks", effect.mask);
-    } else {
-        effect.rgba.fill(0);
-        effect.bits.fill(0);
-    }
-    if effect.flags.len() != grid_w * grid_h {
-        effect.flags = vec![0u8; grid_w * grid_h];
-    }
-    effect.flags.fill(0);
-    if effect.fm.len() != grid_w * grid_h {
-        effect.fm = vec![0u8; grid_w * grid_h];
-        effect.compose = vec![0u8; grid_w * grid_h];
-    }
-    effect.grid_w = grid_w;
-    effect.grid_h = grid_h;
-
-    // Chart space -> mask cell space. Chart space has y pointing down, exactly
-    // like the reference canvas, so no vertical flip here.
+/// Rasterise one zone into `flags` (bit 0 = normal coverage, bit 1 = subtract).
+fn rasterize(flags: &mut [u8], z: &Zone, aspect: f32, grid_w: usize, grid_h: usize) {
     let to_cell = |p: Vector| {
         let u = (p.x + 1.) * 0.5 * grid_w as f32;
         let v = (p.y * aspect + 1.) * 0.5 * grid_h as f32;
         (u, v)
     };
-
-    // 1. Per-cell coverage. `flags` bit 0 = covered by a normal block, bit 1 =
-    //    covered by a subtract block (official `SubtractBlockBlender` overwrites
-    //    with 0.1 instead of accumulating, so these are plain booleans).
-    for z in zones {
-        let (s, c) = z.angle.sin_cos();
-        let corners = [(-1., -1.), (1., -1.), (1., 1.), (-1., 1.)].map(|(x, y)| {
-            let (x, y) = (x * z.half.x, y * z.half.y);
-            Vector::new(z.center.x + c * x - s * y, z.center.y + s * x + c * y)
-        });
-        let cells: Vec<(f32, f32)> = corners.iter().map(|p| to_cell(*p)).collect();
-        let min_y = cells.iter().map(|c| c.1).fold(f32::INFINITY, f32::min).floor().max(0.) as usize;
-        let max_y = cells.iter().map(|c| c.1).fold(f32::NEG_INFINITY, f32::max).ceil().min(grid_h as f32) as usize;
-        let mask_bit: u8 = if z.invert { 2 } else { 1 };
-        for gy in min_y..max_y {
-            let y = gy as f32 + 0.5;
-            // Even-odd scanline: collect x where the polygon crosses this row.
-            let mut xs = [0f32; 4];
-            let mut n = 0;
-            for i in 0..4 {
-                let (x0, y0) = cells[i];
-                let (x1, y1) = cells[(i + 1) % 4];
-                if (y0 <= y) != (y1 <= y) {
-                    xs[n] = x0 + (y - y0) / (y1 - y0) * (x1 - x0);
-                    n += 1;
-                }
+    let (s, c) = z.angle.sin_cos();
+    let corners = [(-1., -1.), (1., -1.), (1., 1.), (-1., 1.)].map(|(x, y)| {
+        let (x, y) = (x * z.half.x, y * z.half.y);
+        Vector::new(z.center.x + c * x - s * y, z.center.y + s * x + c * y)
+    });
+    let cells: Vec<(f32, f32)> = corners.iter().map(|p| to_cell(*p)).collect();
+    let min_y = cells.iter().map(|c| c.1).fold(f32::INFINITY, f32::min).floor().max(0.) as usize;
+    let max_y = cells
+        .iter()
+        .map(|c| c.1)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min(grid_h as f32) as usize;
+    let mask_bit: u8 = if z.invert { 2 } else { 1 };
+    for gy in min_y..max_y {
+        let y = gy as f32 + 0.5;
+        // Even-odd scanline: collect x where the polygon crosses this row.
+        let mut xs = [0f32; 4];
+        let mut n = 0;
+        for i in 0..4 {
+            let (x0, y0) = cells[i];
+            let (x1, y1) = cells[(i + 1) % 4];
+            if (y0 <= y) != (y1 <= y) {
+                xs[n] = x0 + (y - y0) / (y1 - y0) * (x1 - x0);
+                n += 1;
             }
-            if n < 2 {
-                continue;
-            }
-            xs[..n].sort_by(f32::total_cmp);
-            for pair in xs[..n].chunks_exact(2) {
-                let x0 = pair[0].max(0.).floor() as usize;
-                let x1 = pair[1].min(grid_w as f32).ceil() as usize;
-                for gx in x0..x1 {
-                    effect.flags[gy * grid_w + gx] |= mask_bit;
-                }
+        }
+        if n < 2 {
+            continue;
+        }
+        xs[..n].sort_by(f32::total_cmp);
+        for pair in xs[..n].chunks_exact(2) {
+            let x0 = pair[0].max(0.).floor() as usize;
+            let x1 = pair[1].min(grid_w as f32).ceil() as usize;
+            for gx in x0..x1 {
+                flags[gy * grid_w + gx] |= mask_bit;
             }
         }
     }
+}
 
-    // 2. `compose = |norm - (subtract inside the [0.09, 0.12) window ? 255 : 0)|`.
-    for i in 0..grid_w * grid_h {
-        let f = effect.flags[i];
-        let inside = (f & 1 != 0) ^ (f & 2 != 0);
-        effect.compose[i] = if inside { 255 } else { 0 };
+/// `compose = |norm - (subtract inside [0.09, 0.12))|`, i.e. a plain XOR.
+fn compose(src: &[u8], dst: &mut [u8]) {
+    for (i, slot) in dst.iter_mut().enumerate() {
+        let f = src[i];
+        *slot = if (f & 1 != 0) ^ (f & 2 != 0) { 255 } else { 0 };
     }
+}
 
-    // 3. Per-cell noise displacement (official BlockCompose pass 0).
+/// Nine-grid dilation in 64-bit words: three vertical ORs then a 3-bit
+/// horizontal spread (much cheaper than the per-pixel 3x3 loop).
+fn dilate(src: &[u64], merge: &mut [u64], dst: &mut [u64], w: usize, h: usize) {
+    let stride = w.div_ceil(64);
+    let tail = w % 64;
+    let last_mask = if tail == 0 { u64::MAX } else { (1u64 << tail) - 1 };
+
+    for y in 0..h {
+        let row = y * stride;
+        for wi in 0..stride {
+            let mut v = src[row + wi];
+            if y > 0 {
+                v |= src[row - stride + wi];
+            }
+            if y + 1 < h {
+                v |= src[row + stride + wi];
+            }
+            merge[row + wi] = v;
+        }
+    }
+    for y in 0..h {
+        let row = y * stride;
+        for wi in 0..stride {
+            let v = merge[row + wi];
+            let mut o = v | (v << 1) | (v >> 1);
+            if wi > 0 {
+                o |= merge[row + wi - 1] >> 63;
+            }
+            if wi + 1 < stride {
+                o |= merge[row + wi + 1] << 63;
+            }
+            dst[row + wi] = o;
+        }
+        dst[row + stride - 1] &= last_mask;
+    }
+}
+
+/// Rebuild the RGBA mask for the given zones.
+///
+/// `r` = active fill, `g` = edge ring, `b` = glow, `a` = disabled fill. The
+/// active and disabled layers are composited from different zone sets; only the
+/// active one is dilated (the disabled layer has no ring or glow).
+fn rebuild(effect: &mut Effect, zones: &[Zone], aspect: f32, grid_w: usize, grid_h: usize, time: f32) {
+    let tex_w = grid_w * 2;
+    let tex_h = grid_h * 2;
+    let n = grid_w * grid_h;
+    let stride = tex_w.div_ceil(64);
+
+    if effect.tex_w != tex_w || effect.tex_h != tex_h {
+        effect.tex_w = tex_w;
+        effect.tex_h = tex_h;
+        effect.image = Image {
+            width: tex_w as u16,
+            height: tex_h as u16,
+            bytes: vec![0; tex_w * tex_h * 4],
+        };
+        effect.bits = vec![0u64; stride * tex_h];
+        effect.scratch = vec![0u64; stride * tex_h];
+        effect.merge = vec![0u64; stride * tex_h];
+        effect.mask = Texture2D::from_rgba8(tex_w as u16, tex_h as u16, &effect.image.bytes);
+        effect.material.set_texture("uMasks", effect.mask);
+    } else {
+        effect.image.bytes.fill(0);
+        effect.bits.fill(0);
+    }
+    effect.grid_w = grid_w;
+    effect.grid_h = grid_h;
+
+    if effect.flags_active.len() != n {
+        effect.flags_active = vec![0u8; n];
+        effect.flags_disabled = vec![0u8; n];
+        effect.compose_active = vec![0u8; n];
+        effect.compose_disabled = vec![0u8; n];
+        effect.fm_active = vec![0u8; n];
+        effect.fm_disabled = vec![0u8; n];
+    }
+    let _t_raster = std::time::Instant::now();
+    effect.flags_active.fill(0);
+    effect.flags_disabled.fill(0);
+
+    for z in zones {
+        let flags = if z.active {
+            &mut effect.flags_active
+        } else {
+            &mut effect.flags_disabled
+        };
+        rasterize(flags, z, aspect, grid_w, grid_h);
+    }
+    let raster_ms = _t_raster.elapsed().as_secs_f64() * 1000.;
+    let _t_noise = std::time::Instant::now();
+    compose(&effect.flags_active, &mut effect.compose_active);
+    compose(&effect.flags_disabled, &mut effect.compose_disabled);
+
+    // Per-cell noise displacement (official BlockCompose pass 0). Both layers
+    // use the same displacement field, exactly like the reference.
     let d = 0.70703125f32;
     let dt = d * (time / 20. * 2.59);
     let amp = 0.1; // "噪声强度" 1 = official
@@ -327,46 +420,98 @@ fn rebuild(effect: &mut Effect, zones: &[Zone], aspect: f32, grid_w: usize, grid
         for y in 0..grid_h {
             wy_row[y] = noise_index(dt + ((y as f32 + 0.5) / grid_h as f32) * 1.02, nh) * nw;
         }
-        for y in 0..grid_h {
-            let row = wy_row[y];
-            for x in 0..grid_w {
-                let a = effect.centered[effect.noise_r[row + wx_a[x]] as usize];
-                let b = effect.centered[effect.noise_r[row + wx_b[x]] as usize];
-                let u = (d * a + b * -d) * amp + (x as f32 + 0.5) / grid_w as f32;
-                let v = (d * a + b * d) * amp + (y as f32 + 0.5) / grid_h as f32;
-                let sxi = ((u * grid_w as f32).floor() as i64).clamp(0, grid_w as i64 - 1) as usize;
-                let syi = ((v * grid_h as f32).floor() as i64).clamp(0, grid_h as i64 - 1) as usize;
-                effect.fm[y * grid_w + x] = effect.compose[syi * grid_w + sxi];
-            }
+        // The per-cell displacement is the hottest CPU loop (1.6 ms at 1080p),
+        // so split the rows across threads. Results are written per row, so the
+        // split is deterministic.
+        let mut fm_active = std::mem::take(&mut effect.fm_active);
+        let mut fm_disabled = std::mem::take(&mut effect.fm_disabled);
+        {
+            let compose_active = &effect.compose_active;
+            let compose_disabled = &effect.compose_disabled;
+            let noise_r = &effect.noise_r;
+            let centered = &effect.centered;
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(1, 8);
+            let rows_per = grid_h.div_ceil(threads).max(1);
+            std::thread::scope(|scope| {
+                for ((chunk, disabled_chunk), y0) in fm_active
+                    .chunks_mut(rows_per * grid_w)
+                    .zip(fm_disabled.chunks_mut(rows_per * grid_w))
+                    .zip((0..grid_h).step_by(rows_per))
+                {
+                    let wx_a = &wx_a;
+                    let wx_b = &wx_b;
+                    let wy_row = &wy_row;
+                    scope.spawn(move || {
+                        for (dy, (row_out, disabled_row)) in chunk
+                            .chunks_mut(grid_w)
+                            .zip(disabled_chunk.chunks_mut(grid_w))
+                            .enumerate()
+                        {
+                            let y = y0 + dy;
+                            let row = wy_row[y];
+                            for x in 0..grid_w {
+                                let a = centered[noise_r[row + wx_a[x]] as usize];
+                                let b = centered[noise_r[row + wx_b[x]] as usize];
+                                let u = (d * a + b * -d) * amp + (x as f32 + 0.5) / grid_w as f32;
+                                let v = (d * a + b * d) * amp + (y as f32 + 0.5) / grid_h as f32;
+                                let sxi = ((u * grid_w as f32).floor() as i64)
+                                    .clamp(0, grid_w as i64 - 1) as usize;
+                                let syi = ((v * grid_h as f32).floor() as i64)
+                                    .clamp(0, grid_h as i64 - 1) as usize;
+                                let idx = syi * grid_w + sxi;
+                                row_out[x] = compose_active[idx];
+                                disabled_row[x] = compose_disabled[idx];
+                            }
+                        }
+                    });
+                }
+            });
         }
+        effect.fm_active = fm_active;
+        effect.fm_disabled = fm_disabled;
     }
 
-    // 4. 2x nearest upscale into RGBA + bitset.
-    let stride = tex_w.div_ceil(64);
+    let noise_ms = _t_noise.elapsed().as_secs_f64() * 1000.;
+    let _t_up = std::time::Instant::now();
+    // 2x nearest upscale: r = active fill (and the bitset), a = disabled fill.
     for gy in 0..grid_h {
         for gx in 0..grid_w {
-            let m = effect.fm[gy * grid_w + gx];
-            if m == 0 {
+            let idx = gy * grid_w + gx;
+            let active = effect.fm_active[idx];
+            let disabled = effect.fm_disabled[idx];
+            if active == 0 && disabled == 0 {
                 continue;
             }
             for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                 let x = gx * 2 + dx;
                 let y = gy * 2 + dy;
-                effect.rgba[(y * tex_w + x) * 4] = m;
-                effect.bits[y * stride + (x >> 6)] |= 1u64 << (x & 63);
+                let o = (y * tex_w + x) * 4;
+                if active != 0 {
+                    effect.image.bytes[o] = active;
+                    effect.bits[y * stride + (x >> 6)] |= 1u64 << (x & 63);
+                }
+                if disabled != 0 {
+                    effect.image.bytes[o + 3] = disabled;
+                }
             }
         }
     }
 
-    // 5. Edge / glow: nine-grid dilation + ring extraction. `edgePassesOf()`
-    //    with the official edgeStrength = 6 gives one edge ring.
+    let upscale_ms = _t_up.elapsed().as_secs_f64() * 1000.;
+    let _t_dil = std::time::Instant::now();
+    // Edge / glow: nine-grid dilation + ring extraction. `edgePassesOf()` with
+    // the official edgeStrength = 6 gives one edge ring; `w < 0.01` stops early
+    // (the official loop has the same break, so only five passes run).
     let edge_passes = 1;
     for pass in 0..6 {
         let w = GLOW_W[pass];
         if w < 0.01 {
             break;
         }
-        dilate(&mut effect.bits, &mut effect.scratch, tex_w, tex_h);
+        dilate(&effect.bits, &mut effect.merge, &mut effect.scratch, tex_w, tex_h);
         for y in 0..tex_h {
             let base = y * stride;
             for wi in 0..stride {
@@ -377,9 +522,9 @@ fn rebuild(effect: &mut Effect, zones: &[Zone], aspect: f32, grid_w: usize, grid
                     if x < tex_w {
                         let dst = (y * tex_w + x) * 4;
                         if pass < edge_passes {
-                            effect.rgba[dst + 1] = 255;
+                            effect.image.bytes[dst + 1] = 255;
                         }
-                        effect.rgba[dst + 2] = (w * 255.) as u8;
+                        effect.image.bytes[dst + 2] = (w * 255.) as u8;
                     }
                     ring &= ring - 1;
                 }
@@ -388,37 +533,17 @@ fn rebuild(effect: &mut Effect, zones: &[Zone], aspect: f32, grid_w: usize, grid
         std::mem::swap(&mut effect.bits, &mut effect.scratch);
     }
 
-    effect.mask.update(&Image {
-        width: tex_w as u16,
-        height: tex_h as u16,
-        bytes: effect.rgba.clone(),
-    });
-}
-
-fn dilate(src: &mut [u64], dst: &mut [u64], w: usize, h: usize) {
-    dst.fill(0);
-    let stride = w.div_ceil(64);
-    for y in 0..h {
-        for x in 0..w {
-            let bit = src[y * stride + (x >> 6)] & (1u64 << (x & 63));
-            if bit == 0 {
-                continue;
-            }
-            for dy in -1i32..=1 {
-                let ny = y as i32 + dy;
-                if ny < 0 || ny >= h as i32 {
-                    continue;
-                }
-                for dx in -1i32..=1 {
-                    let nx = x as i32 + dx;
-                    if nx < 0 || nx >= w as i32 {
-                        continue;
-                    }
-                    dst[ny as usize * stride + (nx as usize >> 6)] |= 1u64 << (nx & 63);
-                }
-            }
-        }
+    let dilate_ms = _t_dil.elapsed().as_secs_f64() * 1000.;
+    let _t_up2 = std::time::Instant::now();
+    // The GPU upload is the single most expensive step on software Vulkan
+    // (2.4 ms for 0.5 MB at 1080p). Static block areas produce identical bytes,
+    // so skip the upload in that case.
+    if effect.last_upload != effect.image.bytes {
+        effect.mask.update(&effect.image);
+        effect.last_upload.clear();
+        effect.last_upload.extend_from_slice(&effect.image.bytes);
     }
+    effect.stage_ms = (raster_ms, noise_ms, upscale_ms, dilate_ms, _t_up2.elapsed().as_secs_f64() * 1000.);
 }
 
 /// Upload the chart time as an `f32` in a 1x1 RGBA texture.
@@ -447,18 +572,56 @@ pub fn draw(
     if zones.is_empty() || viewport.2 <= 0 || viewport.3 <= 0 {
         return;
     }
+    // Debug switch: render the same chart with and without 噪域 for A/B frames.
+    if std::env::var_os("PRPR_BLOCK_OFF").is_some() {
+        return;
+    }
     let mut guard = EFFECT.lock().unwrap();
     let effect = guard.get_or_insert_with(create);
 
     let grid_w = ((viewport.2 as f32 / BLOCK_PX).floor() as usize).max(8).min(1024);
     let grid_h = ((viewport.3 as f32 / BLOCK_PX).floor() as usize).max(8).min(1024);
-    rebuild(effect, zones, aspect, grid_w, grid_h, time);
+    // The mask only drifts with the noise field (0.13 cells/second) and with the
+    // zone transforms, so rebuilding it at 30 Hz is visually identical while
+    // halving the CPU cost (and the GPU upload) on 60 fps output.
+    let mut hash = 0xcbf29ce484222325u64;
+    for z in zones {
+        for v in [z.center.x, z.center.y, z.half.x, z.half.y, z.angle] {
+            hash ^= v.to_bits() as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= z.active as u64 | (z.invert as u64) << 1;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let stale = effect.last_hash != hash || time - effect.last_build_time >= 1.0 / 30.0 - 1e-6;
+    let t0 = std::time::Instant::now();
+    if stale {
+        rebuild(effect, zones, aspect, grid_w, grid_h, time);
+        effect.last_hash = hash;
+        effect.last_build_time = time;
+    }
+    let rebuild_ms = if stale { t0.elapsed().as_secs_f64() * 1000. } else { 0. };
     upload_clock(effect, time);
+    if std::env::var_os("PRPR_BLOCK_TIME").is_some() {
+        effect.build_ms += rebuild_ms;
+        effect.build_n += 1;
+        if effect.build_n % 120 == 0 {
+            let (r, n, u, d, up) = effect.stage_ms;
+            eprintln!(
+                "[block-time] rebuild avg {:.2}ms over {} frames (last: raster {r:.2} noise {n:.2} upscale {u:.2} dilate {d:.2} upload {up:.2})",
+                effect.build_ms / effect.build_n as f64,
+                effect.build_n
+            );
+        }
+    }
     if std::env::var_os("PRPR_BLOCK_DEBUG").is_some() {
-        let lit = effect.rgba.chunks_exact(4).filter(|p| p[0] > 0).count();
+        let active = effect.image.bytes.chunks_exact(4).filter(|p| p[0] > 0).count();
+        let disabled = effect.image.bytes.chunks_exact(4).filter(|p| p[3] > 0).count();
         eprintln!(
-            "[block] zones={} grid={grid_w}x{grid_h} lit={lit} tex={}x{}",
+            "[block] zones={} active={} disabled={} grid={grid_w}x{grid_h} tex={}x{}",
             zones.len(),
+            active,
+            disabled,
             effect.tex_w,
             effect.tex_h
         );
@@ -466,12 +629,11 @@ pub fn draw(
         if effect.dumped < 3 && effect.seen % 400 == 0 {
             effect.dumped += 1;
             let path = format!("/tmp/ba-mask-{}-{}.raw", effect.seen, effect.dumped);
-            let mut bytes = Vec::with_capacity(8 + effect.rgba.len());
+            let mut bytes = Vec::with_capacity(8 + effect.image.bytes.len());
             bytes.extend_from_slice(&(effect.tex_w as u32).to_le_bytes());
             bytes.extend_from_slice(&(effect.tex_h as u32).to_le_bytes());
-            bytes.extend_from_slice(&effect.rgba);
+            bytes.extend_from_slice(&effect.image.bytes);
             let _ = std::fs::write(&path, bytes);
-            eprintln!("[block] dumped {path}");
         }
     }
 
@@ -514,7 +676,8 @@ void main() {
 
     // Translated from the reference's `FRAG_SRC` (decompiled official shader).
     // Every constant mirrors `BASE_COLORS` / `BASE_FLOATS`; the active layer
-    // runs `fullActive()` with `_TouchPosCount == 0`.
+    // runs `fullActive()` and the inactive one `disabledColor()` with
+    // `_TouchPosCount == 0`.
     pub const FRAGMENT: &str = r#"#version 450 core
 layout(location = 0) in vec2 uv;
 layout(location = 1) in vec4 color;
@@ -550,6 +713,14 @@ const float DISPLACE_STRENGTH = 0.15;
 const vec2 DISPLACE_DIRECTION = vec2(1.0, 1.0);
 const float BACKGROUND_PIXEL_SCALE = 6.0;
 
+// Disabled layer (`BASE_COLORS` / `BASE_FLOATS` of the official shader).
+const vec3 DISABLED_FILL_COLOR = vec3(0.497, 0.13766898, 0.13766898);
+const float DISABLED_FILL_OPACITY = 0.4;
+const vec3 DISABLED_SPARK_TINT = vec3(0.31132078, 0.077830195, 0.077830195);
+const float DISABLED_SPARK_OPACITY = 3.5;
+const float DISABLED_SPARK_INTENSITY = 2.29;
+const float DISABLED_SPEED = 0.3;
+
 // `_EffectRT_TexelSize.zw * 0.5` — the mask *grid* size (the texture is 2x).
 vec2 basePixelUV(vec2 uvv, vec2 effectSize) {
     vec2 size = effectSize * 0.5;
@@ -571,6 +742,23 @@ float chartTime() {
               | (uint(floor(b.b * 255.0 + 0.5)) << 16)
               | (uint(floor(b.a * 255.0 + 0.5)) << 24);
     return uintBitsToFloat(bits);
+}
+
+// Official `disabledColor()`: no edge ring, no glow, just the muted fill.
+vec4 disabledColor(float mask, vec2 fieldUV, float time) {
+    if (mask < 0.0001) { discard; }
+    vec2 dir = normalize(DISPLACE_DIRECTION);
+    float dt = (time / 20.0) * DISABLED_SPEED;
+    vec2 dispUV = fieldUV * vec2(0.5, 0.2);
+    float d0 = texture(uDisplaceTex, dispUV + dir * dt).x;
+    float d1 = texture(uDisplaceTex, dispUV + vec2(-dir.y, dir.x) * dt).x;
+    float avgD = (d0 + d1) * 0.5;
+    vec2 off = dir * (d0 - 0.5) + vec2(-dir.y, dir.x) * (d1 - 0.5);
+    vec2 sparkUV = off * DISABLED_SPARK_INTENSITY + fieldUV * vec2(3.0, 1.2);
+    float sparkV = texture(uSparkTex, sparkUV).x;
+    vec3 col = avgD * (vec3(sparkV) * DISABLED_SPARK_TINT) * DISABLED_SPARK_OPACITY
+             + DISABLED_FILL_COLOR * DISABLED_FILL_OPACITY;
+    return vec4(mask * col, 1.0);
 }
 
 vec4 fullActive(vec2 fieldUV, float time, vec2 screenSize, vec2 effectSize) {
@@ -654,13 +842,30 @@ vec4 fullActive(vec2 fieldUV, float time, vec2 screenSize, vec2 effectSize) {
     vec3 fillCol = FILL_STRENGTH * (sparkOut - fillBase) + fillBase;
     vec3 edgeGlow = glowTerm * GLOW_COLOR + EDGE_COLOR * edgeA;
     vec3 outCol = fillCol * fill + edgeGlow;
-    float outA = glowW * GLOW_INTENSITY + (fill * FILL_OPACITY + edgeA);
+    // The reference relies on GL clamping gl_FragColor to [0, 1]; without that,
+    // fill + edge can exceed 1 and `1 - alpha` goes negative, which crushes the
+    // destination to black.
+    float outA = min(glowW * GLOW_INTENSITY + (fill * FILL_OPACITY + edgeA), 1.0);
     return vec4(outCol, outA);
 }
 
 void main() {
     vec2 effectSize = vec2(textureSize(uMasks, 0));
     vec2 screenSize = vec2(textureSize(uScene, 0));
-    fragColor = fullActive(uv, chartTime(), screenSize, effectSize) * color;
+    vec2 pxUV = (floor(uv * effectSize) + 0.5) / effectSize;
+    vec4 mask = texture(uMasks, basePixelUV(uv, effectSize));
+    float edge = texture(uMasks, pxUV).g;
+    float glow = texture(uMasks, uv).b;
+    float activeMask = mask.r + edge + glow;
+
+    vec4 result;
+    if (activeMask > 0.0001) {
+        result = fullActive(uv, chartTime(), screenSize, effectSize);
+    } else if (mask.a > 0.0001) {
+        result = disabledColor(mask.a, uv, chartTime());
+    } else {
+        discard;
+    }
+    fragColor = vec4(result.rgb, clamp(result.a, 0.0, 1.0)) * color;
 }"#;
 }

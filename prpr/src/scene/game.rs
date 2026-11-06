@@ -1850,6 +1850,10 @@ impl Scene for GameScene {
         target: Option<RenderTarget>,
     ) -> Result<()> {
         self.res.camera.render_target = target;
+        // 噪域 must sit above the chart but below the HUD, so when a chart has
+        // block areas the UI is drawn on the screen after the 噪域 pass instead
+        // of into the chart target (official layer order).
+        let has_block_effect = !self.chart.block_areas.is_empty();
         let res = &mut self.res;
         let asp = ui.viewport.2 as f32 / ui.viewport.3 as f32;
 
@@ -1947,7 +1951,7 @@ impl Scene for GameScene {
             }
         }
 
-        {
+        if !has_block_effect {
             set_camera(&Camera2D {
                 zoom: vec2_asp,
                 viewport: chart_target_vp,
@@ -1969,7 +1973,7 @@ impl Scene for GameScene {
             }
         }
 
-        {
+        if !has_block_effect {
             set_camera(&Camera2D {
                 zoom: vec2(1., -asp2),
                 viewport: chart_target_vp,
@@ -2016,7 +2020,7 @@ impl Scene for GameScene {
                 // 噪域 (`blockAreaList`) runs as a post pass over the resolved
                 // chart target: the shader samples that texture for refraction,
                 // so it has to be drawn after the blit above.
-                if !self.chart.block_areas.is_empty() {
+                if has_block_effect {
                     let zones = self.chart.block_effect_zones(&self.res);
                     let texture = target.output().texture;
                     crate::core::draw_block_effect(
@@ -2028,6 +2032,25 @@ impl Scene for GameScene {
                         (-1., -ui.top, 2., ui.top * 2.),
                     );
                 }
+            }
+            if has_block_effect {
+                // Same normalised space as the chart-target camera (y up), but
+                // drawn straight onto the screen so the HUD stays above 噪域.
+                let chart_ratio = self.current_chart_ratio;
+                set_camera(&Camera2D {
+                    zoom: vec2(chart_ratio, -asp),
+                    viewport: Some(ui.viewport),
+                    render_target: self.res.camera.render_target,
+                    ..Default::default()
+                });
+                self.ui(ui, tm)?;
+                set_camera(&Camera2D {
+                    zoom: vec2(1., -asp),
+                    viewport: Some(ui.viewport),
+                    render_target: self.res.camera.render_target,
+                    ..Default::default()
+                });
+                self.overlay_ui(ui, tm)?;
             }
         } else {
             self.gl.flush();
