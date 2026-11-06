@@ -1924,6 +1924,9 @@ impl Scene for GameScene {
                 .or_else(|| res.camera.render_pass()),
         );
 
+        // 噪域 (`blockAreaList`), drawn over the chart in world coordinates.
+        self.chart.render_block_overlay(res);
+
         self.bad_notes.retain(|dummy| dummy.render(res));
         let t = tm.real_time();
         let dt = (t - std::mem::replace(&mut self.last_update_time, t)) as f32;

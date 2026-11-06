@@ -87,6 +87,10 @@ pub struct Config {
     pub combo_anim: bool,
     pub emitting: bool,
     pub score_aim: bool,
+    /// 噪域 (`blockAreaList`) renderer. The original fork's GPU shader path is
+    /// GL-only; this Vulkan branch always uses the flat CPU renderer, and this
+    /// flag is kept so shared configs still deserialize.
+    pub block_area_simple: bool,
 
     // for compatibility
     pub autoplay: Option<bool>,
@@ -153,6 +157,7 @@ impl Default for Config {
             combo_anim: false,
             emitting: false,
             score_aim: false,
+            block_area_simple: true,
 
             ui_score: true,
             ui_combo: true,
