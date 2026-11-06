@@ -1,32 +1,38 @@
-//! Flat 噪域 (block area) renderer, ported from `ziheng18/block-area-edit`
+//! 噪域 (block area) renderer, ported from `ziheng18/block-area-edit`
 //! (GPL-3.0-only) to Rust / macroquad.
 //!
-//! The editor's "实机贴合" (machine-truth) view is the reference: the visible
-//! region is `U XOR S` — the union of normal blocks, inverted by an **odd**
-//! number of subtract blocks — filled with the block colour (default noise red
-//! `#FF5454`) at `0.72` alpha while active and `0.15` alpha while disabled.
-//! A disabled region is not drawn underneath an active one (the editor cuts it
-//! out with `destination-out`, so the two alphas never stack).
+//! The reference draws two different things and we follow its **stage view**
+//! (`renderStage`, the default `colorPreview = true` branch) line by line:
+//!   * every visible block is drawn on its own, in list order, so overlapping
+//!     blocks stack their translucency instead of being merged into one shape;
+//!   * fill = the block colour at `0.34` while active and `0.12` while
+//!     disabled (`#FF5454` is the editor's `NOISE_DEFAULT_COLOR`);
+//!   * border = the same colour at `0.98` / `0.45`, `1.6px` / `1px` wide;
+//!   * subtract blocks keep the fill but get a `5,3` dashed border.
 //!
-//! Differences from the editor's canvas implementation that come from this
-//! being a per-frame GPU renderer rather than an editing view:
-//!   * the mask is evaluated analytically (planar sweep over edge crossings)
-//!     instead of compositing temporary canvases, so it costs nothing at 4K;
-//!   * only the machine-truth fill is implemented — the editor's lighter
-//!     "colour preview" view (0.34/0.12 + outlines) is an editing aid, not
-//!     something that ends up in a rendered video;
-//!   * official `blockAreaList` has no colour channel, so every block uses the
-//!     editor's default red. `Zone` keeps the geometry only.
+//! The editor's other branch ("实机贴合") collapses everything into a single
+//! `U XOR S` mask at `0.72` / `0.15`; it is *not* what this port renders.
+//!
+//! Differences forced by the medium: the editor works in screen pixels, while
+//! this runs in chart space inside the chart camera, so pixel-sized borders and
+//! dashes are converted with the caller-provided `units_per_px`.
 use super::{BlockArea, BlockPhase, Vector};
 use macroquad::prelude::*;
-use std::cell::RefCell;
 
 /// The editor's `NOISE_DEFAULT_COLOR`: `[255, 84, 84]` (#FF5454).
 pub const DEFAULT_COLOR: [f32; 3] = [255. / 255., 84. / 255., 84. / 255.];
-/// `globalAlpha` the editor uses for the active mask in machine-truth mode.
-pub const ACTIVE_ALPHA: f32 = 0.72;
-/// `globalAlpha` the editor uses for the disabled mask.
-pub const DISABLED_ALPHA: f32 = 0.15;
+/// `CORE.colorCss(q.color, q.active ? 0.34 : 0.12)`.
+pub const ACTIVE_FILL: f32 = 0.34;
+pub const DISABLED_FILL: f32 = 0.12;
+/// `sctx.strokeStyle = …(q.active ? 0.98 : 0.45)`.
+pub const ACTIVE_STROKE: f32 = 0.98;
+pub const DISABLED_STROKE: f32 = 0.45;
+/// `sctx.lineWidth = q.active ? 1.6 : 1`.
+pub const ACTIVE_BORDER_PX: f32 = 1.6;
+pub const DISABLED_BORDER_PX: f32 = 1.;
+/// `sctx.setLineDash(q.subtract ? [5, 3] : [])`.
+const DASH_ON_PX: f32 = 5.;
+const DASH_OFF_PX: f32 = 3.;
 
 /// A block area resolved at one instant: a rotated rectangle in chart space
 /// (x in `[-1, 1]`, y in `[-1/aspect, 1/aspect]`).
@@ -58,177 +64,71 @@ impl Zone {
             active: phase == BlockPhase::Active,
         })
     }
-}
 
-#[derive(Clone, Copy)]
-struct Boundary {
-    slope: f64,
-    intercept: f64,
-    bottom: f64,
-    top: f64,
-    /// `+1` for a left edge, `-1` for a right edge; summing them over a span
-    /// yields how many rectangles cover it.
-    delta: f64,
-    invert: bool,
-    active: bool,
-}
-
-impl Boundary {
-    fn x(self, y: f64) -> f64 {
-        self.slope * y + self.intercept
+    /// The four corners in the same order as the editor's `quadCorners`:
+    /// bottom-left, bottom-right, top-right, top-left.
+    fn corners(&self) -> [Vec2; 4] {
+        let (s, c) = self.angle.sin_cos();
+        [(-1., -1.), (1., -1.), (1., 1.), (-1., 1.)].map(|(x, y)| {
+            let (x, y) = (x * self.half.x, y * self.half.y);
+            vec2(self.center.x + c * x - s * y, self.center.y + s * x + c * y)
+        })
     }
 }
 
-struct Bands {
-    zones: Vec<Zone>,
-    aspect: f32,
-    quads: Vec<([Vec2; 4], f32)>,
-}
-
-thread_local! {
-    static BANDS: RefCell<Bands> = RefCell::new(Bands {
-        zones: Vec::new(),
-        aspect: f32::NAN,
-        quads: Vec::new(),
-    });
-}
-
-pub fn draw(aspect: f32, zones: &[Zone]) {
-    BANDS.with(|cached| {
-        let mut cached = cached.borrow_mut();
-        if cached.aspect != aspect || cached.zones != zones {
-            cached.aspect = aspect;
-            cached.zones.clear();
-            cached.zones.extend_from_slice(zones);
-            cached.quads = tessellate(aspect, zones);
-        }
-        gl_use_default_material();
-        for &(p, alpha) in &cached.quads {
-            let fill = Color::new(DEFAULT_COLOR[0], DEFAULT_COLOR[1], DEFAULT_COLOR[2], alpha);
-            draw_triangle(p[0], p[1], p[2], fill);
-            draw_triangle(p[0], p[2], p[3], fill);
-        }
-    });
-}
-
-/// Split the viewport into vertical bands whose left-to-right edge order is
-/// constant, then emit one quad per visible span.
-fn tessellate(aspect: f32, zones: &[Zone]) -> Vec<([Vec2; 4], f32)> {
-    if !aspect.is_finite() || aspect <= 0. {
-        return Vec::new();
+/// Draw every visible block like the editor's default stage view.
+///
+/// `units_per_px` is how many chart units one pixel covers, used to keep the
+/// border width and the dash pattern looking the same at any render size.
+pub fn draw(aspect: f32, zones: &[Zone], units_per_px: f32) {
+    if !aspect.is_finite() || aspect <= 0. || !units_per_px.is_finite() || units_per_px <= 0. {
+        return;
     }
-    let half_height = 1. / aspect as f64;
-    let mut cuts = vec![-half_height, half_height];
-    let mut edges = Vec::new();
+    gl_use_default_material();
+    let base = Color::new(DEFAULT_COLOR[0], DEFAULT_COLOR[1], DEFAULT_COLOR[2], 1.);
     for z in zones {
-        let (s, c) = (z.angle as f64).sin_cos();
-        let corners = [(-1., -1.), (1., -1.), (1., 1.), (-1., 1.)].map(|(x, y)| {
-            let (x, y) = (x * z.half.x as f64, y * z.half.y as f64);
-            (z.center.x as f64 + c * x - s * y, z.center.y as f64 + s * x + c * y)
-        });
-        if corners.iter().any(|&(x, y)| !x.is_finite() || !y.is_finite()) {
+        let cs = z.corners();
+        if cs.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
             continue;
         }
+        let (fill_alpha, stroke_alpha, width_px) = if z.active {
+            (ACTIVE_FILL, ACTIVE_STROKE, ACTIVE_BORDER_PX)
+        } else {
+            (DISABLED_FILL, DISABLED_STROKE, DISABLED_BORDER_PX)
+        };
+        let fill = Color { a: fill_alpha, ..base };
+        draw_triangle(cs[0], cs[1], cs[2], fill);
+        draw_triangle(cs[0], cs[2], cs[3], fill);
+
+        let stroke = Color { a: stroke_alpha, ..base };
+        let width = width_px * units_per_px;
         for i in 0..4 {
-            let (a, b) = (corners[i], corners[(i + 1) % 4]);
-            if a.1 == b.1 {
-                continue;
-            }
-            let (bottom, top) = (a.1.min(b.1).max(-half_height), a.1.max(b.1).min(half_height));
-            if bottom >= top {
-                continue;
-            }
-            let slope = (b.0 - a.0) / (b.1 - a.1);
-            let edge = Boundary {
-                slope,
-                intercept: a.0 - slope * a.1,
-                bottom,
-                top,
-                delta: if b.1 > a.1 { -1. } else { 1. },
-                invert: z.invert,
-                active: z.active,
-            };
-            cuts.extend([bottom, top]);
-            // A slanted side can leave/re-enter the viewport horizontally, so
-            // the band split has to include those crossings too.
-            if slope != 0. {
-                for x in [-1., 1.] {
-                    let y = (x - edge.intercept) / slope;
-                    if y > bottom && y < top {
-                        cuts.push(y);
-                    }
-                }
-            }
-            edges.push(edge);
+            edge(cs[i], cs[(i + 1) % 4], width, stroke, z.invert, units_per_px);
         }
     }
-    // Split wherever two edges cross, so inside a band their x order is fixed.
-    for (i, a) in edges.iter().enumerate() {
-        for b in &edges[..i] {
-            let divisor = a.slope - b.slope;
-            if divisor == 0. {
-                continue;
-            }
-            let y = (b.intercept - a.intercept) / divisor;
-            if y > a.bottom.max(b.bottom) && y < a.top.min(b.top) {
-                cuts.push(y);
-            }
-        }
+}
+
+fn edge(a: Vec2, b: Vec2, width: f32, color: Color, dashed: bool, units_per_px: f32) {
+    if !dashed {
+        draw_line(a.x, a.y, b.x, b.y, width, color);
+        return;
     }
-    cuts.sort_unstable_by(f64::total_cmp);
-    cuts.dedup();
-    let mut result = Vec::new();
-    let mut crossings = Vec::new();
-    for band in cuts.windows(2) {
-        let (lo, hi) = (band[0], band[1]);
-        let mid = (lo + hi) * 0.5;
-        if mid == lo || mid == hi {
-            continue;
-        }
-        crossings.clear();
-        crossings.extend(edges.iter().copied().filter(|e| e.bottom < mid && mid < e.top));
-        crossings.sort_unstable_by(|a, b| a.x(mid).total_cmp(&b.x(mid)));
-        let (mut active_normal, mut active_subtract) = (0_i64, 0_i64);
-        let (mut disabled_normal, mut disabled_subtract) = (0_i64, 0_i64);
-        for pair in crossings.windows(2) {
-            let (left, right) = (pair[0], pair[1]);
-            if left.active {
-                if left.invert {
-                    active_subtract += left.delta as i64;
-                } else {
-                    active_normal += left.delta as i64;
-                }
-            } else if left.invert {
-                disabled_subtract += left.delta as i64;
-            } else {
-                disabled_normal += left.delta as i64;
-            }
-            // `U XOR S`: a span is visible when it is covered by a normal block
-            // or by an odd number of subtract blocks, but not both.
-            let active_visible = (active_normal > 0) != (active_subtract % 2 != 0);
-            let disabled_visible = (disabled_normal > 0) != (disabled_subtract % 2 != 0);
-            // An active span wins; the editor cuts the disabled mask out from
-            // under it instead of letting 0.15 stack on top of 0.72.
-            let alpha = if active_visible {
-                ACTIVE_ALPHA
-            } else if disabled_visible {
-                DISABLED_ALPHA
-            } else {
-                continue;
-            };
-            if left.x(mid).max(-1.) >= right.x(mid).min(1.) {
-                continue;
-            }
-            let p = [
-                vec2(left.x(lo).clamp(-1., 1.) as f32, lo as f32),
-                vec2(right.x(lo).clamp(-1., 1.) as f32, lo as f32),
-                vec2(right.x(hi).clamp(-1., 1.) as f32, hi as f32),
-                vec2(left.x(hi).clamp(-1., 1.) as f32, hi as f32),
-            ];
-            result.push((p, alpha));
-        }
+    let delta = b - a;
+    let len = delta.length();
+    if !(len > 1e-6) {
+        return;
     }
-    result
+    let dir = delta / len;
+    let on = DASH_ON_PX * units_per_px;
+    let period = (DASH_ON_PX + DASH_OFF_PX) * units_per_px;
+    let mut t = 0.;
+    while t < len {
+        let end = (t + on).min(len);
+        let p = a + dir * t;
+        let q = a + dir * end;
+        draw_line(p.x, p.y, q.x, q.y, width, color);
+        t += period;
+    }
 }
 
 #[cfg(test)]
@@ -239,78 +139,39 @@ mod tests {
         Zone { center: Vector::new(x, y), half: Vector::new(hx, hy), angle, invert, active }
     }
 
-    fn coverage(ranges: &[([Vec2; 4], f32)], p: Vector) -> Option<f32> {
-        ranges
-            .iter()
-            .find(|(q, _)| {
-                if p.y < q[0].y || p.y >= q[2].y {
-                    return false;
-                }
-                let t = (p.y - q[0].y) / (q[2].y - q[0].y);
-                let left = q[0].x + (q[3].x - q[0].x) * t;
-                let right = q[1].x + (q[2].x - q[1].x) * t;
-                p.x > left && p.x < right
-            })
-            .map(|(_, alpha)| *alpha)
+    #[test]
+    fn corners_follow_the_rotated_rectangle() {
+        let z = zone(0.25, -0.5, 0.2, 0.1, 0., false, true);
+        let cs = z.corners();
+        assert!((cs[0].x - 0.05).abs() < 1e-6 && (cs[0].y + 0.6).abs() < 1e-6);
+        assert!((cs[1].x - 0.45).abs() < 1e-6 && (cs[1].y + 0.6).abs() < 1e-6);
+        assert!((cs[2].x - 0.45).abs() < 1e-6 && (cs[2].y + 0.4).abs() < 1e-6);
+        assert!((cs[3].x - 0.05).abs() < 1e-6 && (cs[3].y + 0.4).abs() < 1e-6);
+
+        // A quarter turn swaps the extents around the same centre.
+        let r = zone(0., 0., 0.2, 0.1, std::f32::consts::FRAC_PI_2, false, true);
+        let cs = r.corners();
+        assert!((cs[0].x - 0.1).abs() < 1e-6 && (cs[0].y + 0.2).abs() < 1e-6);
     }
 
     #[test]
-    fn machine_mask_matches_xor_of_normal_and_subtract_coverage() {
-        let zones = [
-            zone(-0.3, 0.05, 0.42, 0.15, 0.2, false, true),
-            zone(0.1, -0.1, 0.34, 0.29, -0.9, false, true),
-            zone(0., 0., 1.5, 1., 0., true, true),
-            zone(0.6, 0.2, 0.35, 0.13, 1.2, true, true),
-            zone(0.6, 0.2, 0.15, 0.09, -0.4, true, true),
-        ];
-        let aspect = 16. / 9.;
-        let ranges = tessellate(aspect, &zones);
-        for y in 0..53 {
-            for x in 0..97 {
-                let p = Vector::new((x as f32 + 0.37) * 2. / 97. - 1., ((y as f32 + 0.41) * 2. / 53. - 1.) / aspect);
-                let (mut normal, mut subtract) = (false, 0);
-                for z in &zones {
-                    let q = nalgebra::Rotation2::new(-z.angle) * (p - z.center);
-                    if q.x.abs() < z.half.x && q.y.abs() < z.half.y {
-                        if z.invert {
-                            subtract += 1;
-                        } else {
-                            normal = true;
-                        }
-                    }
-                }
-                let visible = normal ^ (subtract % 2 == 1);
-                assert_eq!(coverage(&ranges, p).is_some(), visible, "({x},{y})");
-                if visible {
-                    assert!((coverage(&ranges, p).unwrap() - ACTIVE_ALPHA).abs() < 1e-6);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn disabled_regions_use_the_faint_alpha_and_never_stack_under_active_ones() {
-        let disabled = zone(0., 0., 0.5, 0.25, 0., false, false);
-        let ranges = tessellate(1., &[disabled]);
-        assert_eq!(ranges.len(), 1);
-        assert!((ranges[0].1 - DISABLED_ALPHA).abs() < 1e-6);
-
-        // Same rectangle, once disabled and once active → one quad at 0.72.
-        let active = zone(0., 0., 0.5, 0.25, 0., false, true);
-        let ranges = tessellate(1., &[disabled, active]);
-        assert_eq!(ranges.len(), 1);
-        assert!((ranges[0].1 - ACTIVE_ALPHA).abs() < 1e-6);
-    }
-
-    #[test]
-    fn odd_subtract_counts_are_visible_and_even_ones_cancel() {
-        let s = zone(0., 0., 1., 1., 0., true, true);
-        assert_eq!(tessellate(1., &[s]).len(), 1, "one subtract inverts the empty region");
-        assert!(tessellate(1., &[s, s]).is_empty(), "two subtracts cancel out");
-        assert_eq!(tessellate(1., &[s, s, s]).len(), 1, "three subtracts invert again");
-        // A normal block flips the other way round.
-        let n = zone(0., 0., 1., 1., 0., false, true);
-        assert!(tessellate(1., &[n, s]).is_empty(), "normal plus one subtract hides");
-        assert_eq!(tessellate(1., &[n, s, s]).len(), 1, "normal plus two subtracts shows");
+    fn zone_phase_comes_from_the_block_timeline() {
+        let area = BlockArea {
+            top_right: Vector::new(1., 1.),
+            bottom_left: Vector::zeros(),
+            appear_time: 1.,
+            enable_time: 2.,
+            disable_time: 3.,
+            disappear_time: 4.,
+            is_subtract: false,
+            rotate_events: vec![],
+            move_events: vec![],
+            scale_events: vec![],
+        };
+        assert!(Zone::from_area(&area, 0.5, 1.).is_none());
+        assert!(!Zone::from_area(&area, 1.5, 1.).unwrap().active);
+        assert!(Zone::from_area(&area, 2.5, 1.).unwrap().active);
+        assert!(!Zone::from_area(&area, 3.5, 1.).unwrap().active);
+        assert!(Zone::from_area(&area, 4.5, 1.).is_none());
     }
 }

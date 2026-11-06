@@ -337,8 +337,13 @@ impl Chart {
         }
         let flip_x = res.config.flip_x();
         let zones = self.block_zones(res);
+        // The chart camera shows `2 * chart_ratio` world units across the
+        // viewport, so one pixel is that much divided by the viewport width.
+        // Borders and dashes are authored in pixels by the reference editor.
+        let vp = crate::ext::get_viewport();
+        let units_per_px = 2.0 * res.chart_ratio_inv / vp.2.max(1) as f32;
         res.apply_model_of(&Matrix::identity().append_nonuniform_scaling(&Vector::new(if flip_x { -1. } else { 1. }, -1.)), |res| {
-            draw_block_areas(res.aspect_ratio, &zones);
+            draw_block_areas(res.aspect_ratio, &zones, units_per_px);
         });
     }
 
