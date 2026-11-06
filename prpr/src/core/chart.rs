@@ -1,5 +1,5 @@
 use super::{
-    draw_block_areas, BlockArea, BpmList, Effect, JudgeLine, JudgeLineKind, Matrix, Resource, UIElement, Vector, Video, Zone,
+    BlockArea, BpmList, Effect, JudgeLine, JudgeLineKind, Matrix, Resource, UIElement, Vector, Video, Zone,
 };
 use crate::{fs::FileSystem, judge::JudgeStatus, ui::Ui};
 use anyhow::{Context, Result};
@@ -327,24 +327,11 @@ impl Chart {
         });
     }
 
-    /// Official `ActiveBlock` runs at `CameraEvent::AfterForwardAlpha`, i.e. as
-    /// postprocessing after sprites, notes and HUD. Touch centres are absent
-    /// here: an offline render has no fingers, and the port does not implement
-    /// 噪域触摸感染.
-    pub fn render_block_overlay(&self, res: &mut Resource) {
-        if self.block_areas.is_empty() {
-            return;
-        }
-        let flip_x = res.config.flip_x();
-        let zones = self.block_zones(res);
-        // The chart camera shows `2 * chart_ratio` world units across the
-        // viewport, so one pixel is that much divided by the viewport width.
-        // Borders and dashes are authored in pixels by the reference editor.
-        let vp = crate::ext::get_viewport();
-        let units_per_px = 2.0 * res.chart_ratio_inv / vp.2.max(1) as f32;
-        res.apply_model_of(&Matrix::identity().append_nonuniform_scaling(&Vector::new(if flip_x { -1. } else { 1. }, -1.)), |res| {
-            draw_block_areas(res.aspect_ratio, &zones, units_per_px);
-        });
+    /// Resolve the 噪域 rectangles for the current frame. The effect itself is
+    /// drawn by `GameScene` once the chart target has been composited, because
+    /// the shader samples that texture.
+    pub fn block_effect_zones(&self, res: &Resource) -> Vec<Zone> {
+        self.block_zones(res).to_vec()
     }
 
     /// Whether this chart has any 噪域 at all.

@@ -1924,9 +1924,6 @@ impl Scene for GameScene {
                 .or_else(|| res.camera.render_pass()),
         );
 
-        // 噪域 (`blockAreaList`), drawn over the chart in world coordinates.
-        self.chart.render_block_overlay(res);
-
         self.bad_notes.retain(|dummy| dummy.render(res));
         let t = tm.real_time();
         let dt = (t - std::mem::replace(&mut self.last_update_time, t)) as f32;
@@ -2015,6 +2012,22 @@ impl Scene for GameScene {
                         ..Default::default()
                     },
                 );
+
+                // 噪域 (`blockAreaList`) runs as a post pass over the resolved
+                // chart target: the shader samples that texture for refraction,
+                // so it has to be drawn after the blit above.
+                if !self.chart.block_areas.is_empty() {
+                    let zones = self.chart.block_effect_zones(&self.res);
+                    let texture = target.output().texture;
+                    crate::core::draw_block_effect(
+                        &zones,
+                        self.res.aspect_ratio,
+                        (texture.width() as i32, texture.height() as i32, texture.width() as i32, texture.height() as i32),
+                        texture,
+                        tm.now() as f32,
+                        (-1., -ui.top, 2., ui.top * 2.),
+                    );
+                }
             }
         } else {
             self.gl.flush();
