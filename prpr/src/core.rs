@@ -19,8 +19,8 @@ mod block;
 pub use block::{
     block_touch_blocked, touch_inset_world, BlockArea, BlockMoveEvent, BlockPhase, BlockRotateEvent, BlockScaleEvent, BlockTransform,
 };
-mod block_simple;
-pub use block_simple::{draw as draw_block_ranges, Zone};
+mod block_render;
+pub use block_render::{draw as draw_block_areas, Zone};
 mod block_timeline;
 
 mod chart;

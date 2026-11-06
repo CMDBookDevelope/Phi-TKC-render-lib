@@ -1,5 +1,5 @@
 use super::{
-    draw_block_ranges, BlockArea, BpmList, Effect, JudgeLine, JudgeLineKind, Matrix, Resource, UIElement, Vector, Video, Zone,
+    draw_block_areas, BlockArea, BpmList, Effect, JudgeLine, JudgeLineKind, Matrix, Resource, UIElement, Vector, Video, Zone,
 };
 use crate::{fs::FileSystem, judge::JudgeStatus, ui::Ui};
 use anyhow::{Context, Result};
@@ -320,12 +320,6 @@ impl Chart {
         let mut gpu = self.render_gpu.borrow_mut();
         gpu.resize_with(self.lines.len(), LineRenderGpu::default);
         res.apply_model_of(&Matrix::identity().append_nonuniform_scaling(&Vector::new(if res.config.flip_x() { -1. } else { 1. }, -1.)), |res| {
-            // 噪域 Disabled layer: native Background sorting layer order 2,
-            // judge lines are order 3 — so it goes *before* the lines.
-            if !self.block_areas.is_empty() {
-                let zones = self.block_zones(res);
-                draw_block_ranges(res.aspect_ratio, &zones, true);
-            }
             for &id in &self.order {
                 self.lines[id].render_prepared(ui, res, &self.lines, &buffers[id], &mut gpu[id], id);
             }
@@ -344,7 +338,7 @@ impl Chart {
         let flip_x = res.config.flip_x();
         let zones = self.block_zones(res);
         res.apply_model_of(&Matrix::identity().append_nonuniform_scaling(&Vector::new(if flip_x { -1. } else { 1. }, -1.)), |res| {
-            draw_block_ranges(res.aspect_ratio, &zones, false);
+            draw_block_areas(res.aspect_ratio, &zones);
         });
     }
 
