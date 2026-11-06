@@ -1,0 +1,28 @@
+name: mirror-site
+on:
+  push:
+    branches: [mirror-trigger]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mirror the site
+        run: |
+          mkdir -p site
+          wget --mirror --page-requisites --adjust-extension --convert-links \
+               --no-parent --user-agent="Mozilla/5.0 (X11; Linux x86_64)" \
+               -e robots=off -P site "https://noisepainter.sling.cc.cd/" || true
+          echo '--- files ---'
+          find site -type f -printf '%s %p\n' | sort -rn | head -40
+      - name: Push the mirror
+        run: |
+          git config user.name "mirror-bot"
+          git config user.email "mirror-bot@users.noreply.github.com"
+          git checkout -B mirror-data
+          git add -A site
+          git commit -m "mirror noisepainter.sling.cc.cd" || echo "nothing to commit"
+          git push origin mirror-data --force
