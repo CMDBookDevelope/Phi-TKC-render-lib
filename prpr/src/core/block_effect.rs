@@ -759,8 +759,8 @@ vec4 disabledColor(float mask, vec2 fieldUV, float time) {
     vec3 col = avgD * (vec3(sparkV) * DISABLED_SPARK_TINT) * DISABLED_SPARK_OPACITY
              + DISABLED_FILL_COLOR * DISABLED_FILL_OPACITY;
     // Slightly washed out: the disabled block should read as a faded version of
-    // the active one (+30% white).
-    col = mix(col, vec3(1.0), 0.3);
+    // the active one (+12% white).
+    col = mix(col, vec3(1.0), 0.12);
     // Same opacity as the active fill layer, so both states feel like the same
     // material (the official shader used an opaque 1.0 here).
     return vec4(mask * col, mask * FILL_OPACITY);
