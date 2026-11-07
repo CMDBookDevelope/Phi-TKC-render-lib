@@ -13,7 +13,10 @@
 //!   * the **disabled layer** (`.a`) is the fill of block areas that are not in
 //!     their active window: the reference's `disabledColor()` keeps the inner
 //!     fill (`uDisabledFillColor * uDisabledFillOpacity`) and drops the edge /
-//!     glow ring, which is what the official game shows before a block turns on;
+//!     glow ring. Unlike the reference (which picks either layer per pixel),
+//!     this port always draws the disabled fill as the **base** and composites
+//!     the active layer over it, so the margin around an active block does not
+//!     punch a hole into the inactive blocks underneath;
 //!   * `displace.png` / `spark.png` / `noise.png` are the exact textures the
 //!     reference ships;
 //!   * the fragment shader keeps the official uniforms (`_EdgeColor`,
@@ -747,8 +750,9 @@ float chartTime() {
 }
 
 // Inactive block area: the plain rectangle, no displacement and no textures.
+// It is the base layer, so an active block can be composited on top of it.
 vec4 disabledColor(float mask) {
-    if (mask < 0.0001) { discard; }
+    if (mask < 0.0001) { return vec4(0.0); }
     vec3 col = DISABLED_FILL_COLOR * DISABLED_FILL_OPACITY;
     // Slightly washed out: the disabled block reads as a faded version of the
     // active one (+9% white).
@@ -854,14 +858,19 @@ void main() {
     float glow = texture(uMasks, uv).b;
     float activeMask = mask.r + edge + glow;
 
-    vec4 result;
-    if (activeMask > 0.0001) {
-        result = fullActive(uv, chartTime(), screenSize, effectSize);
-    } else if (mask.a > 0.0001) {
+    // The inactive fill is the base layer: an active block (including its edge
+    // and glow margin) is drawn *over* it instead of replacing it, so the
+    // margin around an active area no longer punches a hole into the inactive
+    // areas underneath.
+    vec4 result = vec4(0.0);
+    if (mask.a > 0.0001) {
         result = disabledColor(mask.a);
-    } else {
-        discard;
     }
+    if (activeMask > 0.0001) {
+        vec4 act = fullActive(uv, chartTime(), screenSize, effectSize);
+        result = act + result * (1.0 - act.a);
+    }
+    if (result.a <= 0.0001) { discard; }
     fragColor = vec4(result.rgb, clamp(result.a, 0.0, 1.0)) * color;
 }"#;
 }
