@@ -29,6 +29,7 @@
 //! the active layer) because macroquad overwrites `_Time` with wall-clock time,
 //! which would desynchronise the effect from the chart during an offline render.
 use super::{BlockArea, BlockPhase, Vector};
+use macroquad::models::{draw_mesh, Mesh, Vertex as MeshVertex};
 use macroquad::prelude::*;
 use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation, PipelineParams, TextureWrap};
 use once_cell::sync::Lazy;
@@ -123,9 +124,25 @@ struct Effect {
     dumped: u32,
     build_ms: f64,
     build_n: u64,
+    rebuilds: u64,
     last_hash: u64,
     last_build_time: f32,
     stage_ms: (f64, f64, f64, f64, f64),
+    /// Horizontal runs (cell-space uv) that can produce a visible fragment.
+    /// The pass draws only these quads instead of the whole screen: on a
+    /// 1080p frame the mask usually covers a fraction of the viewport, and the
+    /// fragment shader is the most expensive part of the effect.
+    runs: Vec<[f32; 4]>,
+    vertices: Vec<MeshVertex>,
+    indices: Vec<u16>,
+    cover: Vec<u8>,
+    cover_dilated: Vec<u8>,
+    full_cover: bool,
+    /// Cached noise-displacement source index per cell (see `rebuild`).
+    disp: Vec<u32>,
+    disp_w: usize,
+    disp_h: usize,
+    disp_time: f32,
 }
 
 static EFFECT: Lazy<Mutex<Option<Effect>>> = Lazy::new(|| Mutex::new(None));
@@ -249,9 +266,20 @@ fn create() -> Effect {
         dumped: 0,
         build_ms: 0.,
         build_n: 0,
+        rebuilds: 0,
         last_hash: 0,
         last_build_time: f32::NEG_INFINITY,
         stage_ms: (0., 0., 0., 0., 0.),
+        runs: Vec::new(),
+        vertices: Vec::new(),
+        indices: Vec::new(),
+        cover: Vec::new(),
+        cover_dilated: Vec::new(),
+        full_cover: false,
+        disp: Vec::new(),
+        disp_w: 0,
+        disp_h: 0,
+        disp_time: f32::NEG_INFINITY,
     }
 }
 
@@ -353,7 +381,45 @@ fn dilate(src: &[u64], merge: &mut [u64], dst: &mut [u64], w: usize, h: usize) {
 /// `r` = active fill, `g` = edge ring, `b` = glow, `a` = disabled fill. The
 /// active and disabled layers are composited from different zone sets; only the
 /// active one is dilated (the disabled layer has no ring or glow).
-fn rebuild(effect: &mut Effect, zones: &[Zone], aspect: f32, grid_w: usize, grid_h: usize, time: f32) {
+/// Rasterise the zones into the two cell grids and compose them.
+///
+/// Returns a digest of the composed grids. Only the rasterised result matters,
+/// so zones that move inside a cell (or fade without crossing a cell boundary)
+/// produce the same digest and do not force a noise + upload pass.
+fn rasterize_zones(effect: &mut Effect, zones: &[Zone], aspect: f32, grid_w: usize, grid_h: usize) -> u64 {
+    let n = grid_w * grid_h;
+    if effect.flags_active.len() != n {
+        effect.flags_active = vec![0u8; n];
+        effect.flags_disabled = vec![0u8; n];
+        effect.compose_active = vec![0u8; n];
+        effect.compose_disabled = vec![0u8; n];
+        effect.fm_active = vec![0u8; n];
+        effect.fm_disabled = vec![0u8; n];
+    }
+    effect.flags_active.fill(0);
+    effect.flags_disabled.fill(0);
+    for z in zones {
+        let flags = if z.active {
+            &mut effect.flags_active
+        } else {
+            &mut effect.flags_disabled
+        };
+        rasterize(flags, z, aspect, grid_w, grid_h);
+    }
+    compose(&effect.flags_active, &mut effect.compose_active);
+    compose(&effect.flags_disabled, &mut effect.compose_disabled);
+
+    let mut digest = 0xcbf29ce484222325u64;
+    for &b in effect.compose_active.iter().chain(effect.compose_disabled.iter()) {
+        digest ^= b as u64;
+        digest = digest.wrapping_mul(0x100000001b3);
+    }
+    digest
+}
+
+/// Rebuild the mask image from the composed grids (noise displacement, 2x
+/// upscale, dilation, coverage runs, GPU upload).
+fn rebuild(effect: &mut Effect, grid_w: usize, grid_h: usize, time: f32, raster_ms: f64) {
     let tex_w = grid_w * 2;
     let tex_h = grid_h * 2;
     let n = grid_w * grid_h;
@@ -379,39 +445,24 @@ fn rebuild(effect: &mut Effect, zones: &[Zone], aspect: f32, grid_w: usize, grid
     effect.grid_w = grid_w;
     effect.grid_h = grid_h;
 
-    if effect.flags_active.len() != n {
-        effect.flags_active = vec![0u8; n];
-        effect.flags_disabled = vec![0u8; n];
-        effect.compose_active = vec![0u8; n];
-        effect.compose_disabled = vec![0u8; n];
-        effect.fm_active = vec![0u8; n];
-        effect.fm_disabled = vec![0u8; n];
-    }
-    let _t_raster = std::time::Instant::now();
-    effect.flags_active.fill(0);
-    effect.flags_disabled.fill(0);
-
-    for z in zones {
-        let flags = if z.active {
-            &mut effect.flags_active
-        } else {
-            &mut effect.flags_disabled
-        };
-        rasterize(flags, z, aspect, grid_w, grid_h);
-    }
-    let raster_ms = _t_raster.elapsed().as_secs_f64() * 1000.;
+    let n = n; // kept for the buffer writes below
     let _t_noise = std::time::Instant::now();
-    compose(&effect.flags_active, &mut effect.compose_active);
-    compose(&effect.flags_disabled, &mut effect.compose_disabled);
 
-    // Per-cell noise displacement (official BlockCompose pass 0). Both layers
-    // use the same displacement field, exactly like the reference.
-    let d = 0.70703125f32;
-    let dt = d * (time / 20. * 2.59);
-    let amp = 0.1; // "噪声强度" 1 = official
-    let nw = effect.noise_w.max(1);
-    let nh = effect.noise_h.max(1);
-    {
+    // Per-cell noise displacement (official BlockCompose pass 0). The field only
+    // drifts with chart time (0.13 cells/second), so recompute the source-index
+    // map every 0.25 s instead of on every rebuild - a rebuild happens on every
+    // frame while the zones animate, and this loop used to be the hot spot
+    // (~2 ms at 1080p). The gather below is then O(cells) with no table lookups.
+    let refresh_disp = effect.disp.len() != n
+        || effect.disp_w != grid_w
+        || effect.disp_h != grid_h
+        || (time - effect.disp_time).abs() >= 0.25;
+    if refresh_disp {
+        let d = 0.70703125f32;
+        let dt = d * (time / 20. * 2.59);
+        let amp = 0.1; // "噪声强度" 1 = official
+        let nw = effect.noise_w.max(1);
+        let nh = effect.noise_h.max(1);
         let mut wx_a = vec![0usize; grid_w];
         let mut wx_b = vec![0usize; grid_w];
         let mut wy_row = vec![0usize; grid_h];
@@ -423,60 +474,58 @@ fn rebuild(effect: &mut Effect, zones: &[Zone], aspect: f32, grid_w: usize, grid
         for y in 0..grid_h {
             wy_row[y] = noise_index(dt + ((y as f32 + 0.5) / grid_h as f32) * 1.02, nh) * nw;
         }
-        // The per-cell displacement is the hottest CPU loop (1.6 ms at 1080p),
-        // so split the rows across threads. Results are written per row, so the
-        // split is deterministic.
-        let mut fm_active = std::mem::take(&mut effect.fm_active);
-        let mut fm_disabled = std::mem::take(&mut effect.fm_disabled);
-        {
-            let compose_active = &effect.compose_active;
-            let compose_disabled = &effect.compose_disabled;
-            let noise_r = &effect.noise_r;
-            let centered = &effect.centered;
-            let threads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-                .clamp(1, 8);
-            let rows_per = grid_h.div_ceil(threads).max(1);
-            std::thread::scope(|scope| {
-                for ((chunk, disabled_chunk), y0) in fm_active
-                    .chunks_mut(rows_per * grid_w)
-                    .zip(fm_disabled.chunks_mut(rows_per * grid_w))
-                    .zip((0..grid_h).step_by(rows_per))
-                {
-                    let wx_a = &wx_a;
-                    let wx_b = &wx_b;
-                    let wy_row = &wy_row;
-                    scope.spawn(move || {
-                        for (dy, (row_out, disabled_row)) in chunk
-                            .chunks_mut(grid_w)
-                            .zip(disabled_chunk.chunks_mut(grid_w))
-                            .enumerate()
-                        {
-                            let y = y0 + dy;
-                            let row = wy_row[y];
-                            for x in 0..grid_w {
-                                let a = centered[noise_r[row + wx_a[x]] as usize];
-                                let b = centered[noise_r[row + wx_b[x]] as usize];
-                                let u = (d * a + b * -d) * amp + (x as f32 + 0.5) / grid_w as f32;
-                                let v = (d * a + b * d) * amp + (y as f32 + 0.5) / grid_h as f32;
-                                let sxi = ((u * grid_w as f32).floor() as i64)
-                                    .clamp(0, grid_w as i64 - 1) as usize;
-                                let syi = ((v * grid_h as f32).floor() as i64)
-                                    .clamp(0, grid_h as i64 - 1) as usize;
-                                let idx = syi * grid_w + sxi;
-                                row_out[x] = compose_active[idx];
-                                // The disabled layer is drawn as the raw block
-                                // rectangle: no noise displacement, no textures.
-                                disabled_row[x] = compose_disabled[y * grid_w + x];
-                            }
-                        }
-                    });
-                }
-            });
+        if effect.disp.len() != n {
+            effect.disp = vec![0u32; n];
         }
-        effect.fm_active = fm_active;
-        effect.fm_disabled = fm_disabled;
+        let noise_r = &effect.noise_r;
+        let centered = &effect.centered;
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(1, 8);
+        let rows_per = grid_h.div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            for (chunk, y0) in effect
+                .disp
+                .chunks_mut(rows_per * grid_w)
+                .zip((0..grid_h).step_by(rows_per))
+            {
+                let wx_a = &wx_a;
+                let wx_b = &wx_b;
+                let wy_row = &wy_row;
+                scope.spawn(move || {
+                    for (dy, row_out) in chunk.chunks_mut(grid_w).enumerate() {
+                        let y = y0 + dy;
+                        let row = wy_row[y];
+                        for x in 0..grid_w {
+                            let a = centered[noise_r[row + wx_a[x]] as usize];
+                            let b = centered[noise_r[row + wx_b[x]] as usize];
+                            let u = (d * a + b * -d) * amp + (x as f32 + 0.5) / grid_w as f32;
+                            let v = (d * a + b * d) * amp + (y as f32 + 0.5) / grid_h as f32;
+                            let sxi = ((u * grid_w as f32).floor() as i64)
+                                .clamp(0, grid_w as i64 - 1) as usize;
+                            let syi = ((v * grid_h as f32).floor() as i64)
+                                .clamp(0, grid_h as i64 - 1) as usize;
+                            row_out[x] = (syi * grid_w + sxi) as u32;
+                        }
+                    }
+                });
+            }
+        });
+        effect.disp_w = grid_w;
+        effect.disp_h = grid_h;
+        effect.disp_time = time;
+    }
+
+    // Gather the composited zones through the cached displacement field. The
+    // inactive layer is a raw rectangle, so it is not displaced.
+    for y in 0..grid_h {
+        let row = y * grid_w;
+        for x in 0..grid_w {
+            let idx = row + x;
+            effect.fm_active[idx] = effect.compose_active[effect.disp[idx] as usize];
+            effect.fm_disabled[idx] = effect.compose_disabled[idx];
+        }
     }
 
     let noise_ms = _t_noise.elapsed().as_secs_f64() * 1000.;
@@ -539,6 +588,78 @@ fn rebuild(effect: &mut Effect, zones: &[Zone], aspect: f32, grid_w: usize, grid
     }
 
     let dilate_ms = _t_dil.elapsed().as_secs_f64() * 1000.;
+
+    // Which cells can produce a visible fragment? Fill (`r`), ring (`g`), glow
+    // (`b`) and the inactive fill (`a`) all come from the mask itself, so the
+    // pass only has to cover the cells where one of them is non-zero. Dilating
+    // the coverage by one cell keeps the nearest-sampling boundary exact.
+    effect.cover.clear();
+    effect.cover.resize(grid_w * grid_h, 0);
+    for gy in 0..grid_h {
+        for gx in 0..grid_w {
+            let x = gx * 2;
+            let y = gy * 2;
+            let mut hit = false;
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let o = ((y + dy).min(tex_h - 1) * tex_w + (x + dx).min(tex_w - 1)) * 4;
+                let px = &effect.image.bytes[o..o + 4];
+                if px[0] | px[1] | px[2] | px[3] != 0 {
+                    hit = true;
+                    break;
+                }
+            }
+            effect.cover[gy * grid_w + gx] = hit as u8;
+        }
+    }
+    effect.cover_dilated.clear();
+    effect.cover_dilated.resize(grid_w * grid_h, 0);
+    for gy in 0..grid_h {
+        for gx in 0..grid_w {
+            if effect.cover[gy * grid_w + gx] == 0 {
+                continue;
+            }
+            let y0 = gy.saturating_sub(1);
+            let y1 = (gy + 1).min(grid_h - 1);
+            let x0 = gx.saturating_sub(1);
+            let x1 = (gx + 1).min(grid_w - 1);
+            for ny in y0..=y1 {
+                let row = ny * grid_w;
+                for nx in x0..=x1 {
+                    effect.cover_dilated[row + nx] = 1;
+                }
+            }
+        }
+    }
+    effect.runs.clear();
+    for gy in 0..grid_h {
+        let row = gy * grid_w;
+        let v0 = gy as f32 / grid_h as f32;
+        let v1 = (gy + 1) as f32 / grid_h as f32;
+        let mut gx = 0;
+        while gx < grid_w {
+            if effect.cover_dilated[row + gx] == 0 {
+                gx += 1;
+                continue;
+            }
+            let start = gx;
+            while gx < grid_w && effect.cover_dilated[row + gx] != 0 {
+                gx += 1;
+            }
+            effect.runs.push([
+                start as f32 / grid_w as f32,
+                v0,
+                gx as f32 / grid_w as f32,
+                v1,
+            ]);
+        }
+    }
+
+    effect.full_cover = effect.runs.len() == grid_h
+        && effect
+            .runs
+            .chunks_exact(1)
+            .all(|run| run[0][0] == 0. && run[0][2] == 1.);
+
     let _t_up2 = std::time::Instant::now();
     // The GPU upload is the single most expensive step on software Vulkan
     // (2.4 ms for 0.5 MB at 1080p). Static block areas produce identical bytes,
@@ -586,23 +707,25 @@ pub fn draw(
 
     let grid_w = ((viewport.2 as f32 / BLOCK_PX).floor() as usize).max(8).min(1024);
     let grid_h = ((viewport.3 as f32 / BLOCK_PX).floor() as usize).max(8).min(1024);
-    // The mask only drifts with the noise field (0.13 cells/second) and with the
-    // zone transforms, so rebuilding it at 30 Hz is visually identical while
-    // halving the CPU cost (and the GPU upload) on 60 fps output.
-    let mut hash = 0xcbf29ce484222325u64;
-    for z in zones {
-        for v in [z.center.x, z.center.y, z.half.x, z.half.y, z.angle] {
-            hash ^= v.to_bits() as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash ^= z.active as u64 | (z.invert as u64) << 1;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    let stale = effect.last_hash != hash || time - effect.last_build_time >= 1.0 / 30.0 - 1e-6;
+    // Rasterising the zone rectangles is cheap (~0.03 ms at 1080p); the noise
+    // field, the 2x upscale, the dilation and the GPU upload are not. The
+    // rasterised grids only change when a zone edge crosses a cell boundary,
+    // so digest them and skip the expensive part while they are static.
+    let t_raster = std::time::Instant::now();
+    let digest = rasterize_zones(effect, zones, aspect, grid_w, grid_h);
+    let raster_ms = t_raster.elapsed().as_secs_f64() * 1000.;
+    let zones_changed = effect.last_hash != digest;
+    // Even when the zones are static the noise field drifts (0.13 cells per
+    // second of chart time), so refresh it every 0.25 s; 0.03 cells of drift is
+    // invisible. Deriving this from chart time instead of wall time matters:
+    // an offline render advances chart time by 1/fps per frame, so a wall-clock
+    // throttle would rebuild on every frame of a low-fps video.
+    let stale = zones_changed || time - effect.last_build_time >= 0.25 - 1e-6;
     let t0 = std::time::Instant::now();
     if stale {
-        rebuild(effect, zones, aspect, grid_w, grid_h, time);
-        effect.last_hash = hash;
+        effect.rebuilds += 1;
+        rebuild(effect, grid_w, grid_h, time, raster_ms);
+        effect.last_hash = digest;
         effect.last_build_time = time;
     }
     let rebuild_ms = if stale { t0.elapsed().as_secs_f64() * 1000. } else { 0. };
@@ -612,10 +735,19 @@ pub fn draw(
         effect.build_n += 1;
         if effect.build_n % 120 == 0 {
             let (r, n, u, d, up) = effect.stage_ms;
+            let covered: f32 = effect
+                .cover_dilated
+                .iter()
+                .map(|&c| c as f32)
+                .sum::<f32>()
+                / effect.cover_dilated.len().max(1) as f32;
             eprintln!(
-                "[block-time] rebuild avg {:.2}ms over {} frames (last: raster {r:.2} noise {n:.2} upscale {u:.2} dilate {d:.2} upload {up:.2})",
+                "[block-time] rebuild avg {:.2}ms over {} frames (last: raster {r:.2} noise {n:.2} upscale {u:.2} dilate {d:.2} upload {up:.2}) runs={} covered={:.1}% rebuilds={}",
                 effect.build_ms / effect.build_n as f64,
-                effect.build_n
+                effect.build_n,
+                effect.runs.len(),
+                covered * 100.,
+                effect.rebuilds
             );
         }
     }
@@ -642,19 +774,61 @@ pub fn draw(
         }
     }
 
+    // Nothing visible (all zones outside the viewport, or fully transparent).
+    if effect.runs.is_empty() {
+        return;
+    }
     let m = effect.material;
     m.set_texture("uScene", scene);
     gl_use_material(m);
-    draw_texture_ex(
-        effect.white,
-        dst.0,
-        dst.1,
-        WHITE,
-        DrawTextureParams {
-            dest_size: Some(vec2(dst.2, dst.3)),
-            ..Default::default()
-        },
-    );
+
+    if effect.full_cover {
+        // Fully covered: a single quad is cheaper than a mesh round-trip.
+        draw_texture_ex(
+            effect.white,
+            dst.0,
+            dst.1,
+            WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(dst.2, dst.3)),
+                ..Default::default()
+            },
+        );
+        gl_use_default_material();
+        return;
+    }
+
+    let mut verts = std::mem::take(&mut effect.vertices);
+    let mut indices = std::mem::take(&mut effect.indices);
+    verts.clear();
+    indices.clear();
+    for run in &effect.runs {
+        if verts.len() > u16::MAX as usize - 4 {
+            break;
+        }
+        let base = verts.len() as u16;
+        let x0 = dst.0 + dst.2 * run[0];
+        let y0 = dst.1 + dst.3 * run[1];
+        let x1 = dst.0 + dst.2 * run[2];
+        let y1 = dst.1 + dst.3 * run[3];
+        verts.push(MeshVertex { position: vec3(x0, y0, 0.), uv: vec2(run[0], run[1]), color: WHITE });
+        verts.push(MeshVertex { position: vec3(x1, y0, 0.), uv: vec2(run[2], run[1]), color: WHITE });
+        verts.push(MeshVertex { position: vec3(x1, y1, 0.), uv: vec2(run[2], run[3]), color: WHITE });
+        verts.push(MeshVertex { position: vec3(x0, y1, 0.), uv: vec2(run[0], run[3]), color: WHITE });
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    if indices.is_empty() {
+        effect.vertices = verts;
+        effect.indices = indices;
+        gl_use_default_material();
+        return;
+    }
+    {
+        let mesh = Mesh { vertices: verts, indices, texture: None };
+        draw_mesh(&mesh);
+        effect.vertices = mesh.vertices;
+        effect.indices = mesh.indices;
+    }
     gl_use_default_material();
 }
 
