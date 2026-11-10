@@ -223,13 +223,13 @@ async fn try_init(model: &HandVisionTransformer, force: bool) -> Option<Inner> {
     {
         Ok(adapter) => adapter,
         Err(error) => {
-            println!("[hand AI] no wgpu adapter on Vulkan/DX12/Metal/OpenGL: {error}");
+            log::info!("[hand AI] no wgpu adapter on Vulkan/DX12/Metal/OpenGL: {error}");
             return None;
         }
     };
 
     let info = adapter.get_info();
-    println!(
+    log::info!(
         "[hand AI] wgpu adapter: {} [{:?}, {:?}]",
         info.name, info.device_type, info.backend
     );
@@ -244,7 +244,7 @@ async fn try_init(model: &HandVisionTransformer, force: bool) -> Option<Inner> {
         || info.vendor == 0x10005
         || (info.vendor == 0x8086 && name.contains("haswell"));
     if software && !force {
-        println!(
+        log::info!(
             "[hand AI] software/virtual adapter, using the CPU path (PRPR_VIT_GPU=force overrides)"
         );
         return None;
@@ -262,7 +262,7 @@ async fn try_init(model: &HandVisionTransformer, force: bool) -> Option<Inner> {
     {
         Ok(pair) => pair,
         Err(error) => {
-            println!("[hand AI] adapter {} rejected the device request: {error}", info.name);
+            log::info!("[hand AI] adapter {} rejected the device request: {error}", info.name);
             return None;
         }
     };
@@ -308,7 +308,7 @@ async fn try_init(model: &HandVisionTransformer, force: bool) -> Option<Inner> {
     let query_patches = storage_buffer(&device, "vit.query_patches", (query_capacity * 4) as u64);
     let logits = storage_buffer(&device, "vit.logits", (query_capacity * 4) as u64);
 
-    println!("[hand AI] ViT running on the GPU ({})", info.name);
+    log::info!("[hand AI] ViT running on the GPU ({})", info.name);
 
     Some(Inner {
         device,
@@ -340,7 +340,7 @@ impl VitGpu {
         let force = match gpu_policy() {
             GpuPolicy::Off => {
                 GPU_REJECTED.store(true, Ordering::Relaxed);
-                println!("[hand AI] PRPR_VIT_GPU=off, using the CPU path");
+                log::info!("[hand AI] PRPR_VIT_GPU=off, using the CPU path");
                 return None;
             }
             GpuPolicy::Force => true,
@@ -360,7 +360,7 @@ impl VitGpu {
             }
             Err(_) => {
                 GPU_REJECTED.store(true, Ordering::Relaxed);
-                println!("[hand AI] ViT shader/pipeline creation failed, using the CPU path");
+                log::info!("[hand AI] ViT shader/pipeline creation failed, using the CPU path");
                 return None;
             }
         };
@@ -550,7 +550,7 @@ mod tests {
     fn gpu_forward_runs() {
         let model = HandVisionTransformer::new();
         let Some(gpu) = VitGpu::try_new(&model) else {
-            eprintln!("skip: no GPU adapter");
+            log::warn!("skip: no GPU adapter");
             return;
         };
         let frame = vec![0.5f32; crate::hand::AI_IMAGE_SIZE];

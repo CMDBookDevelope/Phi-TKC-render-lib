@@ -743,7 +743,7 @@ pub fn draw(
                     .map(|&c| c as f32)
                     .sum::<f32>()
                     / effect.cover_dilated.len().max(1) as f32;
-                eprintln!(
+                log::warn!(
                     "[block-time] rebuild avg {:.2}ms over {} frames (last: raster {r:.2} noise {n:.2} upscale {u:.2} dilate {d:.2} upload {up:.2}) runs={} covered={:.1}% rebuilds={}",
                     effect.build_ms / effect.build_n as f64,
                     effect.build_n,
@@ -756,7 +756,7 @@ pub fn draw(
         if std::env::var_os("PRPR_BLOCK_DEBUG").is_some() {
             let active = effect.image.bytes.chunks_exact(4).filter(|p| p[0] > 0).count();
             let disabled = effect.image.bytes.chunks_exact(4).filter(|p| p[3] > 0).count();
-            eprintln!(
+            log::warn!(
                 "[block] zones={} active={} disabled={} grid={grid_w}x{grid_h} tex={}x{}",
                 zones.len(),
                 active,

@@ -44,3 +44,31 @@ inner.rs
 # Test
 
 /log*
+
+# AI instructions, tool state and conversation exports stay local.
+AGENTS*.md
+CLAUDE*.md
+GEMINI*.md
+CODEX.md
+SKILL.md
+.claude/
+.codex/
+.cursor/
+.cursorrules
+.windsurf/
+.windsurfrules
+.continue/
+.specstory/
+.aider*
+.agents/
+.agent/
+.ai/
+.roo/
+.roorules
+.clinerules
+.github/copilot-instructions.md
+.github/instructions/
+.github/agents/
+.github/prompts/
+.github/skills/
+dsh-tui-export-*.md

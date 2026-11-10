@@ -12,6 +12,7 @@ closed = []
 log = ["dep:tracing-subscriber", "dep:colored"]
 
 [dependencies]
+log = "0.4"
 smallvec = "1.11.2"
 anyhow = "1.0"
 futures-util = "0.3"
