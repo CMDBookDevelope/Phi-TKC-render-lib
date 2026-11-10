@@ -39,7 +39,6 @@ pub struct Config {
     #[serde(rename = "adjust_time_new")]
     pub adjust_time: bool,
     pub aggressive: bool,
-    pub aspect_ratio: Option<f32>,
     pub audio_buffer_size: Option<u32>,
     pub challenge_color: ChallengeModeColor,
     pub challenge_rank: u32,
@@ -51,7 +50,6 @@ pub struct Config {
     pub disable_effect: bool,
     pub double_click_to_pause: bool,
     pub double_hint: bool,
-    pub fix_aspect_ratio: bool,
     pub fxaa: bool,
     pub interactive: bool,
     pub note_scale: f32,
@@ -113,7 +111,6 @@ impl Default for Config {
         Self {
             adjust_time: false,
             aggressive: false,
-            aspect_ratio: None,
             audio_buffer_size: None,
             challenge_color: ChallengeModeColor::Golden,
             challenge_rank: 45,
@@ -125,7 +122,6 @@ impl Default for Config {
             disable_effect: false,
             double_click_to_pause: true,
             double_hint: true,
-            fix_aspect_ratio: false,
             fxaa: false,
             interactive: true,
             mods: Mods::default(),

@@ -496,10 +496,10 @@ impl Resource {
         let res_pack = ResourcePack::from_path(config.res_pack_path.as_ref())
             .await
             .context("Failed to load resource pack")?;
-            let vec2_ratio = vec2(1.,-config.aspect_ratio.unwrap_or(info.aspect_ratio));
+        let aspect_ratio = screen_width().max(1.) / screen_height().max(1.);
         let camera = Camera2D {
             target: vec2(0., 0.),
-            zoom: vec2_ratio,
+            zoom: vec2(1., -aspect_ratio),
             ..Default::default()
         };
 
@@ -511,7 +511,6 @@ impl Resource {
         let sfx_drag = audio.create_sfx(res_pack.sfx_drag.clone(), buffer_size)?;
         let sfx_flick = audio.create_sfx(res_pack.sfx_flick.clone(), buffer_size)?;
 
-        let aspect_ratio = config.aspect_ratio.unwrap_or(info.aspect_ratio);
         let inv_aspect_ratio = 1.0 / aspect_ratio;
         let chart_ratio_inv = 1.0 / config.chart_ratio;
         let note_width = config.note_scale * NOTE_WIDTH_RATIO_BASE;
@@ -597,39 +596,16 @@ impl Resource {
                 self.config.sample_count
             ));
         }
-        let config_aspect = self.config.aspect_ratio.unwrap_or(self.info.aspect_ratio);
-        self.aspect_ratio = if self.config.fix_aspect_ratio {
-            config_aspect
-        } else {
-            config_aspect.min(width as f32 / height as f32)
-        };
+        // The destination viewport is the only source of the canvas shape.
+        // Legacy chart/config aspect fields must never crop the render target.
+        self.aspect_ratio = width as f32 / height as f32;
         // 更新缓存的倒数和 chart_ratio 倒数，保持与 aspect_ratio 同步
         self.inv_aspect_ratio = 1.0 / self.aspect_ratio;
         self.chart_ratio_inv = 1.0 / self.config.chart_ratio;
-        self.camera.viewport = Some(self.calculate_viewport(vp, self.aspect_ratio));
-        if !self.config.fix_aspect_ratio {
-            self.camera.zoom.y = -self.aspect_ratio;
-        }
+        self.camera.viewport = Some(vp);
+        self.camera.zoom.y = -self.aspect_ratio;
 
         true
-    }
-    fn calculate_viewport(&self, (x, y, w, h): (i32, i32, i32, i32), aspect_ratio: f32) -> (i32, i32, i32, i32) {
-        let (w_f, h_f) = (w as f32, h as f32);
-        let target_width = h_f * aspect_ratio;
-
-        let (rw, rh) = if target_width > w_f {
-            let scaled_height = w_f / aspect_ratio;
-            (w_f, scaled_height)
-        } else {
-            (target_width, h_f)
-        };
-
-        (
-            x + ((w_f - rw) / 2.0).round() as i32,
-            y + ((h_f - rh) / 2.0).round() as i32,
-            rw as i32,
-            rh as i32
-        )
     }
 
     /// Top of prpr's own model stack (screen space = model applied to world space).

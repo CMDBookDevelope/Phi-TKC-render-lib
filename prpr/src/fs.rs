@@ -236,7 +236,7 @@ fn info_from_kv<'a>(it: impl Iterator<Item = (&'a str, String)>, csv: bool) -> R
             infer_diff(&mut info, &value);
         }
         if key == "AspectRatio" {
-            info.aspect_ratio = value.parse().context("invalid aspect ratio")?;
+            // Old archives may carry this field; the viewport determines shape.
             continue;
         }
         if key == "BackgroundDim" {

@@ -32,7 +32,6 @@ pub struct ChartInfo {
 
     pub preview_start: f32,
     pub preview_end: Option<f32>,
-    pub aspect_ratio: f32,
     pub background_dim: f32,
     pub line_length: f32,
     pub offset: f32,
@@ -67,7 +66,6 @@ impl Default for ChartInfo {
 
             preview_start: 0.,
             preview_end: None,
-            aspect_ratio: 16. / 9.,
             background_dim: 0.1,
             line_length: 6.,
             offset: 0.,

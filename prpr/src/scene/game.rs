@@ -1858,12 +1858,12 @@ impl Scene for GameScene {
         let res = &mut self.res;
         let asp = ui.viewport.2 as f32 / ui.viewport.3 as f32;
 
-        let vp = res.camera.viewport.unwrap_or(ui.viewport);
-        let asp2 = vp.2 as f32 / vp.3 as f32;
-        let vec2_asp = vec2(1. * self.current_chart_ratio, -asp2 * self.current_chart_ratio);
         if res.update_size(ui.viewport) || self.mode == GameMode::View {
             set_camera(&res.camera);
         }
+        let vp = res.camera.viewport.unwrap_or(ui.viewport);
+        let asp2 = vp.2 as f32 / vp.3 as f32;
+        let vec2_asp = vec2(1. * self.current_chart_ratio, -asp2 * self.current_chart_ratio);
 
         let msaa = res.config.sample_count > 1;
 

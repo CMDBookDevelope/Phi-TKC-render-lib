@@ -132,35 +132,6 @@ pub fn render_chart_info(ui: &mut Ui, edit: &mut ChartInfoEdit, width: f32) -> (
             }
         }
 
-        let mut string = format!("{:.5}", info.aspect_ratio);
-        let mut changed = false;
-        let r = ui.input(tl!("aspect-ratio"), &mut string, (len, &mut changed));
-        dy!(r.h + s);
-        if changed {
-            match || -> Result<f32> {
-                if let Some((w, h)) = string.split_once([':', '：']) {
-                    Ok(w.trim().parse::<f32>()? / h.trim().parse::<f32>()?)
-                } else {
-                    Ok(string.parse()?)
-                }
-            }() {
-                Err(_) => {
-                    show_message(tl!("illegal-input")).error();
-                }
-                Ok(value) => {
-                    if value.is_finite() && value > 0.0 {
-                        info.aspect_ratio = value;
-                    } else {
-                        show_message(tl!("illegal-input")).error();
-                    }
-                }
-            }
-        }
-        dy!(ui.scope(|ui| {
-            ui.text(tl!("ps")).anchor(1., 0.).size(0.35).draw();
-            ui.text(tl!("aspect-hint")).pos(0.02, 0.).size(0.35).max_width(len).multiline().draw().h + 0.03
-        }));
-
         ui.dx(-rt);
         let r = ui.slider(tl!("dim"), 0.0..1.0, 0.05, &mut info.background_dim, Some(width - 0.2));
         dy!(r.h + s + 0.01);
