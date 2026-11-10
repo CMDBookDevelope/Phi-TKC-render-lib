@@ -32,8 +32,7 @@ use super::{BlockArea, BlockPhase, Vector};
 use macroquad::models::{draw_mesh, Mesh, Vertex as MeshVertex};
 use macroquad::prelude::*;
 use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation, PipelineParams, TextureWrap};
-use once_cell::sync::Lazy;
-use std::sync::Mutex;
+use std::cell::RefCell;
 
 // ---- `BASE_COLORS` / `BASE_FLOATS` from the reference ----------------------
 const EDGE_COLOR: [f32; 3] = [1., 0.33018857, 0.33018857];
@@ -145,7 +144,9 @@ struct Effect {
     disp_time: f32,
 }
 
-static EFFECT: Lazy<Mutex<Option<Effect>>> = Lazy::new(|| Mutex::new(None));
+thread_local! {
+    static EFFECT: RefCell<Option<Effect>> = RefCell::new(None);
+}
 
 fn tex(bytes: &[u8], wrap: TextureWrap) -> Texture2D {
     let image = image::load_from_memory(bytes).expect("block effect texture").to_rgba8();
@@ -702,134 +703,136 @@ pub fn draw(
     if std::env::var_os("PRPR_BLOCK_OFF").is_some() {
         return;
     }
-    let mut guard = EFFECT.lock().unwrap();
-    let effect = guard.get_or_insert_with(create);
+    EFFECT.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        let effect = guard.get_or_insert_with(create);
 
-    let grid_w = ((viewport.2 as f32 / BLOCK_PX).floor() as usize).max(8).min(1024);
-    let grid_h = ((viewport.3 as f32 / BLOCK_PX).floor() as usize).max(8).min(1024);
-    // Rasterising the zone rectangles is cheap (~0.03 ms at 1080p); the noise
-    // field, the 2x upscale, the dilation and the GPU upload are not. The
-    // rasterised grids only change when a zone edge crosses a cell boundary,
-    // so digest them and skip the expensive part while they are static.
-    let t_raster = std::time::Instant::now();
-    let digest = rasterize_zones(effect, zones, aspect, grid_w, grid_h);
-    let raster_ms = t_raster.elapsed().as_secs_f64() * 1000.;
-    let zones_changed = effect.last_hash != digest;
-    // Even when the zones are static the noise field drifts (0.13 cells per
-    // second of chart time), so refresh it every 0.25 s; 0.03 cells of drift is
-    // invisible. Deriving this from chart time instead of wall time matters:
-    // an offline render advances chart time by 1/fps per frame, so a wall-clock
-    // throttle would rebuild on every frame of a low-fps video.
-    let stale = zones_changed || time - effect.last_build_time >= 0.25 - 1e-6;
-    let t0 = std::time::Instant::now();
-    if stale {
-        effect.rebuilds += 1;
-        rebuild(effect, grid_w, grid_h, time, raster_ms);
-        effect.last_hash = digest;
-        effect.last_build_time = time;
-    }
-    let rebuild_ms = if stale { t0.elapsed().as_secs_f64() * 1000. } else { 0. };
-    upload_clock(effect, time);
-    if std::env::var_os("PRPR_BLOCK_TIME").is_some() {
-        effect.build_ms += rebuild_ms;
-        effect.build_n += 1;
-        if effect.build_n % 120 == 0 {
-            let (r, n, u, d, up) = effect.stage_ms;
-            let covered: f32 = effect
-                .cover_dilated
-                .iter()
-                .map(|&c| c as f32)
-                .sum::<f32>()
-                / effect.cover_dilated.len().max(1) as f32;
+        let grid_w = ((viewport.2 as f32 / BLOCK_PX).floor() as usize).max(8).min(1024);
+        let grid_h = ((viewport.3 as f32 / BLOCK_PX).floor() as usize).max(8).min(1024);
+        // Rasterising the zone rectangles is cheap (~0.03 ms at 1080p); the noise
+        // field, the 2x upscale, the dilation and the GPU upload are not. The
+        // rasterised grids only change when a zone edge crosses a cell boundary,
+        // so digest them and skip the expensive part while they are static.
+        let t_raster = std::time::Instant::now();
+        let digest = rasterize_zones(effect, zones, aspect, grid_w, grid_h);
+        let raster_ms = t_raster.elapsed().as_secs_f64() * 1000.;
+        let zones_changed = effect.last_hash != digest;
+        // Even when the zones are static the noise field drifts (0.13 cells per
+        // second of chart time), so refresh it every 0.25 s; 0.03 cells of drift is
+        // invisible. Deriving this from chart time instead of wall time matters:
+        // an offline render advances chart time by 1/fps per frame, so a wall-clock
+        // throttle would rebuild on every frame of a low-fps video.
+        let stale = zones_changed || time - effect.last_build_time >= 0.25 - 1e-6;
+        let t0 = std::time::Instant::now();
+        if stale {
+            effect.rebuilds += 1;
+            rebuild(effect, grid_w, grid_h, time, raster_ms);
+            effect.last_hash = digest;
+            effect.last_build_time = time;
+        }
+        let rebuild_ms = if stale { t0.elapsed().as_secs_f64() * 1000. } else { 0. };
+        upload_clock(effect, time);
+        if std::env::var_os("PRPR_BLOCK_TIME").is_some() {
+            effect.build_ms += rebuild_ms;
+            effect.build_n += 1;
+            if effect.build_n % 120 == 0 {
+                let (r, n, u, d, up) = effect.stage_ms;
+                let covered: f32 = effect
+                    .cover_dilated
+                    .iter()
+                    .map(|&c| c as f32)
+                    .sum::<f32>()
+                    / effect.cover_dilated.len().max(1) as f32;
+                eprintln!(
+                    "[block-time] rebuild avg {:.2}ms over {} frames (last: raster {r:.2} noise {n:.2} upscale {u:.2} dilate {d:.2} upload {up:.2}) runs={} covered={:.1}% rebuilds={}",
+                    effect.build_ms / effect.build_n as f64,
+                    effect.build_n,
+                    effect.runs.len(),
+                    covered * 100.,
+                    effect.rebuilds
+                );
+            }
+        }
+        if std::env::var_os("PRPR_BLOCK_DEBUG").is_some() {
+            let active = effect.image.bytes.chunks_exact(4).filter(|p| p[0] > 0).count();
+            let disabled = effect.image.bytes.chunks_exact(4).filter(|p| p[3] > 0).count();
             eprintln!(
-                "[block-time] rebuild avg {:.2}ms over {} frames (last: raster {r:.2} noise {n:.2} upscale {u:.2} dilate {d:.2} upload {up:.2}) runs={} covered={:.1}% rebuilds={}",
-                effect.build_ms / effect.build_n as f64,
-                effect.build_n,
-                effect.runs.len(),
-                covered * 100.,
-                effect.rebuilds
+                "[block] zones={} active={} disabled={} grid={grid_w}x{grid_h} tex={}x{}",
+                zones.len(),
+                active,
+                disabled,
+                effect.tex_w,
+                effect.tex_h
             );
+            effect.seen += 1;
+            if effect.dumped < 3 && effect.seen % 400 == 0 {
+                effect.dumped += 1;
+                let path = format!("/tmp/ba-mask-{}-{}.raw", effect.seen, effect.dumped);
+                let mut bytes = Vec::with_capacity(8 + effect.image.bytes.len());
+                bytes.extend_from_slice(&(effect.tex_w as u32).to_le_bytes());
+                bytes.extend_from_slice(&(effect.tex_h as u32).to_le_bytes());
+                bytes.extend_from_slice(&effect.image.bytes);
+                let _ = std::fs::write(&path, bytes);
+            }
         }
-    }
-    if std::env::var_os("PRPR_BLOCK_DEBUG").is_some() {
-        let active = effect.image.bytes.chunks_exact(4).filter(|p| p[0] > 0).count();
-        let disabled = effect.image.bytes.chunks_exact(4).filter(|p| p[3] > 0).count();
-        eprintln!(
-            "[block] zones={} active={} disabled={} grid={grid_w}x{grid_h} tex={}x{}",
-            zones.len(),
-            active,
-            disabled,
-            effect.tex_w,
-            effect.tex_h
-        );
-        effect.seen += 1;
-        if effect.dumped < 3 && effect.seen % 400 == 0 {
-            effect.dumped += 1;
-            let path = format!("/tmp/ba-mask-{}-{}.raw", effect.seen, effect.dumped);
-            let mut bytes = Vec::with_capacity(8 + effect.image.bytes.len());
-            bytes.extend_from_slice(&(effect.tex_w as u32).to_le_bytes());
-            bytes.extend_from_slice(&(effect.tex_h as u32).to_le_bytes());
-            bytes.extend_from_slice(&effect.image.bytes);
-            let _ = std::fs::write(&path, bytes);
+
+        // Nothing visible (all zones outside the viewport, or fully transparent).
+        if effect.runs.is_empty() {
+            return;
         }
-    }
+        let m = effect.material;
+        m.set_texture("uScene", scene);
+        gl_use_material(m);
 
-    // Nothing visible (all zones outside the viewport, or fully transparent).
-    if effect.runs.is_empty() {
-        return;
-    }
-    let m = effect.material;
-    m.set_texture("uScene", scene);
-    gl_use_material(m);
+        if effect.full_cover {
+            // Fully covered: a single quad is cheaper than a mesh round-trip.
+            draw_texture_ex(
+                effect.white,
+                dst.0,
+                dst.1,
+                WHITE,
+                DrawTextureParams {
+                    dest_size: Some(vec2(dst.2, dst.3)),
+                    ..Default::default()
+                },
+            );
+            gl_use_default_material();
+            return;
+        }
 
-    if effect.full_cover {
-        // Fully covered: a single quad is cheaper than a mesh round-trip.
-        draw_texture_ex(
-            effect.white,
-            dst.0,
-            dst.1,
-            WHITE,
-            DrawTextureParams {
-                dest_size: Some(vec2(dst.2, dst.3)),
-                ..Default::default()
-            },
-        );
+        let mut verts = std::mem::take(&mut effect.vertices);
+        let mut indices = std::mem::take(&mut effect.indices);
+        verts.clear();
+        indices.clear();
+        for run in &effect.runs {
+            if verts.len() > u16::MAX as usize - 4 {
+                break;
+            }
+            let base = verts.len() as u16;
+            let x0 = dst.0 + dst.2 * run[0];
+            let y0 = dst.1 + dst.3 * run[1];
+            let x1 = dst.0 + dst.2 * run[2];
+            let y1 = dst.1 + dst.3 * run[3];
+            verts.push(MeshVertex { position: vec3(x0, y0, 0.), uv: vec2(run[0], run[1]), color: WHITE });
+            verts.push(MeshVertex { position: vec3(x1, y0, 0.), uv: vec2(run[2], run[1]), color: WHITE });
+            verts.push(MeshVertex { position: vec3(x1, y1, 0.), uv: vec2(run[2], run[3]), color: WHITE });
+            verts.push(MeshVertex { position: vec3(x0, y1, 0.), uv: vec2(run[0], run[3]), color: WHITE });
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        if indices.is_empty() {
+            effect.vertices = verts;
+            effect.indices = indices;
+            gl_use_default_material();
+            return;
+        }
+        {
+            let mesh = Mesh { vertices: verts, indices, texture: None };
+            draw_mesh(&mesh);
+            effect.vertices = mesh.vertices;
+            effect.indices = mesh.indices;
+        }
         gl_use_default_material();
-        return;
-    }
-
-    let mut verts = std::mem::take(&mut effect.vertices);
-    let mut indices = std::mem::take(&mut effect.indices);
-    verts.clear();
-    indices.clear();
-    for run in &effect.runs {
-        if verts.len() > u16::MAX as usize - 4 {
-            break;
-        }
-        let base = verts.len() as u16;
-        let x0 = dst.0 + dst.2 * run[0];
-        let y0 = dst.1 + dst.3 * run[1];
-        let x1 = dst.0 + dst.2 * run[2];
-        let y1 = dst.1 + dst.3 * run[3];
-        verts.push(MeshVertex { position: vec3(x0, y0, 0.), uv: vec2(run[0], run[1]), color: WHITE });
-        verts.push(MeshVertex { position: vec3(x1, y0, 0.), uv: vec2(run[2], run[1]), color: WHITE });
-        verts.push(MeshVertex { position: vec3(x1, y1, 0.), uv: vec2(run[2], run[3]), color: WHITE });
-        verts.push(MeshVertex { position: vec3(x0, y1, 0.), uv: vec2(run[0], run[3]), color: WHITE });
-        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-    }
-    if indices.is_empty() {
-        effect.vertices = verts;
-        effect.indices = indices;
-        gl_use_default_material();
-        return;
-    }
-    {
-        let mesh = Mesh { vertices: verts, indices, texture: None };
-        draw_mesh(&mesh);
-        effect.vertices = mesh.vertices;
-        effect.indices = mesh.indices;
-    }
-    gl_use_default_material();
+    });
 }
 
 mod shader {

@@ -3,9 +3,8 @@ use macroquad::{
     window::get_internal_gl,
     miniquad::{RenderPass, Texture, TextureFormat, TextureParams},
 };
-use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::cell::RefCell;
 
 static C: AtomicU64 = AtomicU64::new(0);
 
@@ -19,7 +18,9 @@ struct Rb {
     staging: Vec<u8>,
 }
 
-static RB: Lazy<Mutex<Rb>> = Lazy::new(|| Mutex::new(Rb { cache: None, target: None, staging: Vec::new() }));
+thread_local! {
+    static RB: RefCell<Rb> = RefCell::new(Rb { cache: None, target: None, staging: Vec::new() });
+}
 
 pub struct MSRenderTarget {
     dim: (u32, u32),
@@ -81,15 +82,17 @@ impl MSRenderTarget {
         let cycle = C.load(Ordering::Relaxed);
         let len = target_w * target_h * 3;
 
-        let mut st = RB.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((cc, cl, d)) = st.cache.as_ref() {
-            if *cc == cycle && *cl == len {
-                return d.clone();
+        RB.with(|slot| {
+            let mut st = slot.borrow_mut();
+            if let Some((cc, cl, d)) = st.cache.as_ref() {
+                if *cc == cycle && *cl == len {
+                    return d.clone();
+                }
             }
-        }
-        let fresh = self.raw(&mut st, target_w, target_h);
-        st.cache = Some((cycle, len, fresh.clone()));
-        fresh
+            let fresh = self.raw(&mut st, target_w, target_h);
+            st.cache = Some((cycle, len, fresh.clone()));
+            fresh
+        })
     }
 
     fn raw(&self, st: &mut Rb, tw: usize, th: usize) -> Vec<f32> {

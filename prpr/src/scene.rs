@@ -39,6 +39,16 @@ thread_local! {
     pub static DIALOG: RefCell<Option<Dialog>> = RefCell::new(None);
 }
 
+/// Release thread-local texture owners while the renderer's GPU is still alive.
+/// Android pthread-key destructors do not guarantee reverse initialization order.
+pub fn clear_thread_resources() {
+    DIALOG.with(|dialog| { dialog.borrow_mut().take(); });
+    BILLBOARD.with(|board| {
+        *board.borrow_mut() = (BillBoard::new(), TimeManager::default());
+    });
+    crate::ext::clear_black_texture();
+}
+
 #[inline]
 pub fn show_error(error: Error) {
     warn!("show error: {error:?}");

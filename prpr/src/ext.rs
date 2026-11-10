@@ -158,7 +158,17 @@ impl From<DynamicImage> for SafeTexture {
     }
 }
 
-pub static BLACK_TEXTURE: Lazy<SafeTexture> = Lazy::new(|| Texture2D::from_rgba8(1, 1, &[0, 0, 0, 255]).into());
+thread_local! {
+    static BLACK: std::cell::RefCell<Option<SafeTexture>> = std::cell::RefCell::new(None);
+}
+pub fn black_texture() -> SafeTexture {
+    BLACK.with(|texture| texture.borrow_mut().get_or_insert_with(
+        || Texture2D::from_rgba8(1, 1, &[0, 0, 0, 255]).into()
+    ).clone())
+}
+pub(crate) fn clear_black_texture() {
+    BLACK.with(|texture| { texture.borrow_mut().take(); });
+}
 
 pub fn nalgebra_to_glm(mat: &Matrix) -> Mat4 {
     /*

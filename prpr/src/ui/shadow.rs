@@ -1,7 +1,7 @@
 use super::Ui;
 use macroquad::prelude::*;
 use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation};
-use once_cell::sync::Lazy;
+use once_cell::unsync::Lazy;
 
 fn alpha_blend_material_params(uniforms: Vec<(String, UniformType)>) -> MaterialParams {
     MaterialParams {
@@ -18,17 +18,19 @@ fn alpha_blend_material_params(uniforms: Vec<(String, UniformType)>) -> Material
     }
 }
 
-static SHADOW_MATERIAL: Lazy<Material> =
-    Lazy::new(|| load_material(shader::VERTEX, shader::SHADOW_FRAGMENT, alpha_blend_material_params(ShadowConfig::uniforms())).unwrap());
+thread_local! {
+    static SHADOW_MATERIAL: Lazy<Material> =
+        Lazy::new(|| load_material(shader::VERTEX, shader::SHADOW_FRAGMENT, alpha_blend_material_params(ShadowConfig::uniforms())).unwrap());
 
-static RR_MATERIAL: Lazy<Material> = Lazy::new(|| {
-    load_material(
-        shader::VERTEX,
-        shader::RR_FRAGMENT,
-        alpha_blend_material_params(vec![("rect".to_owned(), UniformType::Float4), ("radius".to_owned(), UniformType::Float1)]),
-    )
-    .unwrap()
-});
+    static RR_MATERIAL: Lazy<Material> = Lazy::new(|| {
+        load_material(
+            shader::VERTEX,
+            shader::RR_FRAGMENT,
+            alpha_blend_material_params(vec![("rect".to_owned(), UniformType::Float4), ("radius".to_owned(), UniformType::Float1)]),
+        )
+        .unwrap()
+    });
+}
 
 #[derive(Clone, Copy)]
 pub struct ShadowConfig {
@@ -65,7 +67,7 @@ impl ShadowConfig {
 
 pub fn rounded_rect_shadow(ui: &mut Ui, r: Rect, config: &ShadowConfig) {
     // r.y += elevation * 0.5;
-    let mat = *SHADOW_MATERIAL;
+    let mat = SHADOW_MATERIAL.with(|material| **material);
     let gr = ui.rect_to_global(r);
     mat.set_uniform("rect", vec4(gr.x, gr.y, gr.right(), gr.bottom()));
     config.apply(&mat);
@@ -77,7 +79,7 @@ pub fn rounded_rect_shadow(ui: &mut Ui, r: Rect, config: &ShadowConfig) {
 
 pub fn rounded_rect<R>(ui: &mut Ui, r: Rect, radius: f32, f: impl FnOnce(&mut Ui) -> R) -> R {
     // r.y += elevation * 0.5;
-    let mat = *RR_MATERIAL;
+    let mat = RR_MATERIAL.with(|material| **material);
     let gr = ui.rect_to_global(r);
     mat.set_uniform("rect", vec4(gr.x, gr.y, gr.right(), gr.bottom()));
     mat.set_uniform("radius", radius);
