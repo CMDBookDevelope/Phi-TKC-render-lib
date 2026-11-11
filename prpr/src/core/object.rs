@@ -91,10 +91,70 @@ pub struct CtrlObject {
 }
 
 impl CtrlObject {
+    #[inline]
+    fn curve_is_identity(curve: &AnimFloat) -> bool {
+        curve.is_default() || curve.constant_value() == Some(1.0)
+    }
+
+    #[inline]
+    pub(crate) fn is_identity(&self) -> bool {
+        Self::curve_is_identity(&self.alpha)
+            && Self::curve_is_identity(&self.size)
+            && Self::curve_is_identity(&self.pos)
+            && Self::curve_is_identity(&self.y)
+    }
+
+    #[inline]
+    pub(crate) fn y_is_identity(&self) -> bool {
+        Self::curve_is_identity(&self.y)
+    }
+
     pub fn set_height(&mut self, height: f32) {
         self.alpha.set_time(height);
         self.size.set_time(height);
         self.pos.set_time(height);
         self.y.set_time(height);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::Keyframe;
+
+    #[test]
+    fn identity_controls_match_sampling_at_all_heights() {
+        let mut ctrl = CtrlObject {
+            alpha: AnimFloat::new(vec![Keyframe::new(-2., 1., 2), Keyframe::new(3., 1., 2)]),
+            size: AnimFloat::chain(vec![AnimFloat::fixed(0.25), AnimFloat::fixed(0.75)]),
+            pos: AnimFloat::fixed(1.),
+            y: AnimFloat::default(),
+        };
+        assert!(ctrl.is_identity());
+        for height in [-10., -2., 0., 1., 3., 10.] {
+            ctrl.set_height(height);
+            for curve in [&ctrl.alpha, &ctrl.size, &ctrl.pos, &ctrl.y] {
+                assert_eq!(curve.now_opt().unwrap_or(1.), 1.);
+            }
+        }
+    }
+
+    #[test]
+    fn identity_fast_path_rejects_animation_and_near_identity_values() {
+        let varying = AnimFloat::new(vec![Keyframe::new(0., 1., 2), Keyframe::new(1., 0.5, 2)]);
+        let changed_layer = AnimFloat::chain(vec![AnimFloat::fixed(1.), varying.clone()]);
+        for curve in [varying, changed_layer, AnimFloat::fixed(f32::from_bits(1f32.to_bits() + 1))] {
+            for field in 0..4 {
+                let mut ctrl = CtrlObject::default();
+                *match field {
+                    0 => &mut ctrl.alpha,
+                    1 => &mut ctrl.size,
+                    2 => &mut ctrl.pos,
+                    _ => &mut ctrl.y,
+                } = curve.clone();
+                assert!(!ctrl.is_identity());
+                assert_eq!(ctrl.y_is_identity(), field != 3);
+            }
+        }
     }
 }

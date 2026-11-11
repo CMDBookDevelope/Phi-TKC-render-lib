@@ -11,7 +11,7 @@ use macroquad::prelude::*;
 use macroquad::miniquad::{FilterMode, Texture, TextureWrap};
 use sasa::{AudioClip, AudioManager, Sfx};
 use serde::Deserialize;
-use std::{cell::RefCell, collections::BTreeMap, ops::DerefMut, path::Path, sync::atomic::AtomicU32};
+use std::{cell::RefCell, ops::DerefMut, path::Path, sync::atomic::AtomicU32};
 
 /// Quads per `NoteBuffer` mesh chunk. Kept small so a partially filled chunk
 /// still fits into (and can be merged within) a single macroquad draw call.
@@ -343,25 +343,41 @@ impl ParticleEmitter {
 }
 
 #[derive(Default)]
-pub struct NoteBuffer {
-    map: BTreeMap<(i8, u32), Vec<Vertex>>,
+pub struct NoteBuffer { buckets: Vec<NoteBucket>, }
+
+struct NoteBucket {
+    key: (i8, u32),
+    vertices: Vec<Vertex>,
 }
 
 impl NoteBuffer {
+    #[inline]
+    fn bucket_mut(&mut self, key: (i8, u32)) -> &mut Vec<Vertex> {
+        let index = match self.buckets.binary_search_by_key(&key, |bucket| bucket.key) {
+            Ok(index) => index,
+            Err(index) => {
+                self.buckets.insert(index, NoteBucket { key, vertices: Vec::new() });
+                index
+            }
+        };
+        &mut self.buckets[index].vertices
+    }
+
+    #[inline]
     pub fn push(&mut self, key: (i8, u32), vertices: [Vertex; 4]) {
-        self.map.entry(key).or_default().extend_from_slice(&vertices);
+        self.bucket_mut(key).extend_from_slice(&vertices);
     }
 
     pub(crate) fn clear(&mut self) {
-        for vertices in self.map.values_mut() {
-            vertices.clear();
+        for bucket in &mut self.buckets {
+            bucket.vertices.clear();
         }
     }
 
     pub(crate) fn append(&mut self, other: &Self) {
-        for (&key, vertices) in &other.map {
-            if !vertices.is_empty() {
-                self.map.entry(key).or_default().extend_from_slice(vertices);
+        for bucket in &other.buckets {
+            if !bucket.vertices.is_empty() {
+                self.bucket_mut(bucket.key).extend_from_slice(&bucket.vertices);
             }
         }
     }
@@ -377,10 +393,12 @@ impl NoteBuffer {
         gl.flush();
         let gl = gl.quad_gl;
         gl.draw_mode(DrawMode::Triangles);
-        for (&(_, tex_id), vertices) in &mut self.map {
-            if vertices.is_empty() {
+        for bucket in &mut self.buckets {
+            if bucket.vertices.is_empty() {
                 continue;
             }
+            let (_, tex_id) = bucket.key;
+            let vertices = &mut bucket.vertices;
             gl.texture(Some(Texture2D::from_miniquad_texture(unsafe { Texture::from_raw_id(tex_id, miniquad::TextureFormat::RGBA8) })));
             for chunk in vertices.chunks(DRAWCALL_QUADS * 4) {
                 gl.geometry(chunk, &INDICES[..chunk.len() / 4 * 6]);
@@ -429,6 +447,8 @@ pub struct Resource {
 
     pub chart_target: Option<MSRenderTarget>,
     pub no_effect: bool,
+    /// Refraction needs a resolved scene even when ordinary effects and MSAA are disabled.
+    pub(crate) has_block_effect: bool,
 
     pub note_buffer: RefCell<NoteBuffer>,
 
@@ -487,6 +507,7 @@ impl Resource {
         background: SafeTexture,
         illustration: SafeTexture,
         has_no_effect: bool,
+        has_block_effect: bool,
     ) -> Result<Self> {
         macro_rules! load_tex {
             ($path:literal) => {
@@ -561,6 +582,7 @@ impl Resource {
 
             chart_target: None,
             no_effect,
+            has_block_effect,
 
             note_buffer: RefCell::new(NoteBuffer::default()),
 
@@ -590,7 +612,7 @@ impl Resource {
         if width <= 0 || height <= 0 {
             return false;
         }
-        if !self.no_effect || self.config.sample_count != 1 {
+        if !self.no_effect || self.config.sample_count != 1 || self.has_block_effect {
             self.chart_target = Some(MSRenderTarget::new(
                 (width as u32, height as u32),
                 self.config.sample_count
@@ -641,5 +663,39 @@ impl Resource {
         unsafe { get_internal_gl() }.quad_gl.push_model_matrix(nalgebra_to_glm(mat));
         f(self);
         unsafe { get_internal_gl() }.quad_gl.pop_model_matrix();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn note_buckets_preserve_layer_texture_and_submission_order() {
+        let mut reference = BTreeMap::<(i8, u32), Vec<f32>>::new();
+        let mut buffer = NoteBuffer::default();
+        for round in 0..3 {
+            buffer.clear();
+            reference.clear();
+            for chunk in 0..5 {
+                let mut part = NoteBuffer::default();
+                for note in 0..25 {
+                    let key = (((note * 7 + chunk) % 4) as i8, ((note * 11 + round) % 5) as u32);
+                    let id = (chunk * 25 + note) as f32;
+                    part.push(key, [Vertex::new(id, 0., 0., 0., 0., WHITE); 4]);
+                    reference.entry(key).or_default().extend([id; 4]);
+                }
+                buffer.append(&part);
+            }
+            let actual: Vec<_> = buffer.buckets.iter()
+                .filter(|bucket| !bucket.vertices.is_empty())
+                .map(|bucket| (bucket.key, bucket.vertices.iter().map(|v| {
+                    let (position, _, _): ([f32; 3], [f32; 2], [f32; 4]) = (*v).into();
+                    position[0]
+                }).collect::<Vec<_>>()))
+                .collect();
+            assert_eq!(actual, reference.iter().map(|(key, values)| (*key, values.clone())).collect::<Vec<_>>());
+        }
     }
 }

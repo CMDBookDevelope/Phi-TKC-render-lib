@@ -658,6 +658,7 @@ impl GameScene {
             background,
             illustration,
             chart.extra.effects.is_empty() && effects.is_empty(),
+            chart.has_block_areas(),
         )
             .await
             .context("Failed to load resources")?;
@@ -1998,7 +1999,9 @@ impl Scene for GameScene {
             //pop_camera_state();
         }
 
-        if msaa || !self.res.no_effect {
+        // Block areas need the resolved scene even with MSAA=1 and ordinary
+        // chart effects disabled. The target's existence expresses that need.
+        if self.res.chart_target.is_some() {
             if let Some(target) = &self.res.chart_target {
                 self.gl.flush();
                 self.gl.quad_gl.viewport(None);
