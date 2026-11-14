@@ -124,14 +124,28 @@ impl FileSystem for ExternalFileSystem {
 #[derive(Clone)]
 pub struct ZipFileSystem(pub Arc<Mutex<ZipArchive<Cursor<Vec<u8>>>>>, String);
 
+fn is_zip_metadata(path: &str) -> bool {
+    path.split('/').any(|part| part == "__MACOSX" || part == ".DS_Store" || part.starts_with("._"))
+}
+
 impl ZipFileSystem {
     pub fn new(bytes: Vec<u8>) -> Result<Self> {
         let zip = ZipArchive::new(Cursor::new(bytes))?;
-        let root_dirs = zip
-            .file_names()
-            .filter(|it| it.ends_with('/') && it.find('/') == Some(it.len() - 1))
-            .collect::<Vec<_>>();
-        let root = if root_dirs.len() == 1 { root_dirs[0].to_owned() } else { String::new() };
+        // ZIPs need not contain directory entries. Infer the common directory
+        // from actual files, excluding Finder's resource forks and metadata.
+        // A file in the archive root keeps the root empty even when there is
+        // exactly one explicit subdirectory (e.g. chart.json + images/).
+        let mut files = zip.file_names().filter(|name| !name.ends_with('/') && !is_zip_metadata(name));
+        let mut root = files
+            .next()
+            .and_then(|name| name.rfind('/').map(|index| name[..=index].to_owned()))
+            .unwrap_or_default();
+        for name in files {
+            while !name.starts_with(&root) {
+                let parent_end = root[..root.len() - 1].rfind('/').map_or(0, |index| index + 1);
+                root.truncate(parent_end);
+            }
+        }
         Ok(Self(Arc::new(Mutex::new(zip)), root))
     }
 }
@@ -161,7 +175,8 @@ impl FileSystem for ZipFileSystem {
             .lock()
             .unwrap()
             .file_names()
-            .filter(|it| it.strip_prefix(&self.1).map_or(false, |it| !it.contains('/')))
+            .filter_map(|name| name.strip_prefix(&self.1))
+            .filter(|name| !name.is_empty() && !name.contains('/') && !is_zip_metadata(name))
             .map(str::to_owned)
             .collect())
     }
@@ -490,4 +505,112 @@ pub fn fs_from_file(path: &Path) -> Result<Box<dyn FileSystem + Send + Sync + 's
 
 pub fn fs_from_assets(name: impl Into<String>) -> Result<Box<dyn FileSystem + Send + Sync + 'static>> {
     Ok(Box::new(AssetsFileSystem(name.into())))
+}
+
+#[cfg(test)]
+mod zip_tests {
+    use super::*;
+
+    fn archive(prefix: &str, directories: bool, finder_metadata: bool, declared_info: bool) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
+        if directories {
+            if !prefix.is_empty() {
+                writer.add_directory(prefix, options).unwrap();
+            }
+            writer.add_directory(format!("{prefix}images/"), options).unwrap();
+        }
+        // First entry is deliberately deeper than the chart root.
+        for (name, bytes) in [
+            ("images/texture.png", b"texture".as_slice()),
+            ("custom.pec", b"chart"),
+            ("music.ogg", b"music"),
+            ("cover.png", b"cover"),
+        ] {
+            writer.start_file(format!("{prefix}{name}"), options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        if declared_info {
+            writer.start_file(format!("{prefix}info.yml"), options).unwrap();
+            writer.write_all(b"name: Test\nchart: custom.pec\nmusic: music.ogg\nillustration: cover.png\n").unwrap();
+        }
+        if finder_metadata {
+            writer.add_directory("__MACOSX/", options).unwrap();
+            for name in ["__MACOSX/._custom.pec", ".DS_Store", &format!("{prefix}._custom.pec"), &format!("{prefix}.DS_Store")] {
+                writer.start_file(name, options).unwrap();
+                writer.write_all(b"Finder metadata").unwrap();
+            }
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn check_layout(prefix: &str, directories: bool, finder_metadata: bool) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for declared_info in [false, true] {
+            let mut fs = ZipFileSystem::new(archive(prefix, directories, finder_metadata, declared_info)).unwrap();
+            assert_eq!(fs.1, prefix);
+            let mut listed = fs.list_root().unwrap();
+            listed.sort();
+            let mut expected = vec!["cover.png", "custom.pec", "music.ogg"];
+            if declared_info {
+                expected.push("info.yml");
+                expected.sort();
+            }
+            assert_eq!(listed, expected);
+            runtime.block_on(async {
+                let info = load_info(&mut fs).await.unwrap();
+                assert_eq!(info.chart, "custom.pec");
+                assert_eq!(info.music, "music.ogg");
+                assert_eq!(info.illustration, "cover.png");
+                for (path, bytes) in [(info.chart, b"chart".as_slice()), (info.music, b"music"), (info.illustration, b"cover")] {
+                    assert!(fs.exists(&path).await.unwrap());
+                    assert_eq!(fs.load_file(&path).await.unwrap(), bytes);
+                }
+                assert_eq!(fs.load_file("images/texture.png").await.unwrap(), b"texture");
+                assert_eq!(fs.clone_box().load_file("custom.pec").await.unwrap(), b"chart");
+            });
+        }
+    }
+
+    #[test]
+    fn flat_archive_with_a_subdirectory_keeps_chart_root() {
+        check_layout("", true, false);
+    }
+
+    #[test]
+    fn wrapped_archive_lists_and_loads_relative_paths() {
+        check_layout("wrapped/", true, false);
+    }
+
+    #[test]
+    fn wrapped_archive_without_directory_entries_is_inferred() {
+        check_layout("wrapped/", false, false);
+    }
+
+    #[test]
+    fn finder_archive_ignores_metadata_and_resource_forks() {
+        check_layout("谱面包/", true, true);
+        check_layout("", false, true);
+    }
+
+    #[test]
+    fn multiple_wrapper_directories_are_inferred() {
+        check_layout("outer/wrapped/", false, true);
+    }
+
+    #[test]
+    fn metadata_only_archive_has_no_chart_root() {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = FileOptions::default();
+        writer.add_directory("__MACOSX/", options).unwrap();
+        writer.start_file("__MACOSX/._chart.json", options).unwrap();
+        writer.write_all(b"resource fork").unwrap();
+        writer.start_file(".DS_Store", options).unwrap();
+        writer.write_all(b"metadata").unwrap();
+        let mut fs = ZipFileSystem::new(writer.finish().unwrap().into_inner()).unwrap();
+        assert!(fs.1.is_empty());
+        assert!(fs.list_root().unwrap().is_empty());
+        let error = tokio::runtime::Runtime::new().unwrap().block_on(load_info(&mut fs)).err().unwrap();
+        assert!(error.to_string().contains("cannot find chart"));
+    }
 }
