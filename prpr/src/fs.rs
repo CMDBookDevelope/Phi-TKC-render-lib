@@ -334,7 +334,7 @@ fn is_chart_auxiliary(file: &str) -> bool {
 }
 
 /// Exactly one candidate is fine, none means "not found", more than one is an
-/// error: a chart root must not be ambiguous.
+/// error for files that must be selected unambiguously (charts, audio, info).
 fn pick_unique(desc: &str, mut candidates: Vec<String>) -> Result<Option<String>> {
     candidates.sort();
     candidates.dedup();
@@ -381,7 +381,15 @@ async fn resolve_media(fs: &mut dyn FileSystem, info: &mut ChartInfo, meta_music
         }
     }
     if !fs.exists(&info.illustration).await? {
-        if let Some(name) = find_unique_ext(fs, "illustration", IMAGE_EXTS, |_| true).await? {
+        // Charts may contain many image textures alongside their illustration.
+        // With no declared illustration, choose a stable fallback by file name.
+        let image = fs
+            .list_root()
+            .context("cannot list files")?
+            .into_iter()
+            .filter(|file| extension_of(file).is_some_and(|ext| IMAGE_EXTS.contains(&ext.as_str())))
+            .min();
+        if let Some(name) = image {
             info.illustration = name;
         }
     }
@@ -389,8 +397,8 @@ async fn resolve_media(fs: &mut dyn FileSystem, info: &mut ChartInfo, meta_music
 }
 
 /// Resolve file names for an info file read from disk: keep a declared name
-/// when that file exists, otherwise accept the only file with a matching
-/// extension. Ambiguity (>1 match) is reported instead of silently picking one.
+/// when that file exists, otherwise match by extension. Chart and audio matches
+/// must be unique; illustration images may coexist with chart textures.
 pub async fn resolve_files(fs: &mut dyn FileSystem, info: &mut ChartInfo) -> Result<()> {
     if !fs.exists(&info.chart).await? {
         if let Some(chart) = find_unique_ext(fs, "chart", CHART_EXTS, |file| !is_chart_auxiliary(file)).await? {
@@ -510,6 +518,151 @@ pub fn fs_from_assets(name: impl Into<String>) -> Result<Box<dyn FileSystem + Se
 #[cfg(test)]
 mod zip_tests {
     use super::*;
+    use std::{path::PathBuf, sync::atomic::{AtomicUsize, Ordering}};
+
+    struct TestDirectory(PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn media_filesystems(entries: &[(&str, &[u8])]) -> (TestDirectory, Vec<Box<dyn FileSystem>>) {
+        static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+        let directory = TestDirectory(std::env::temp_dir().join(format!(
+            "prpr-media-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed),
+        )));
+        std::fs::create_dir(&directory.0).unwrap();
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
+        for &(name, bytes) in entries {
+            let path = directory.0.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+            writer.start_file(name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        let archive = writer.finish().unwrap().into_inner();
+        let filesystems: Vec<Box<dyn FileSystem>> = vec![
+            Box::new(ZipFileSystem::new(archive).unwrap()),
+            fs_from_file(&directory.0).unwrap(),
+        ];
+        (directory, filesystems)
+    }
+
+    fn check_media(entries: &[(&str, &[u8])], illustration: &str) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (_directory, filesystems) = media_filesystems(entries);
+        for mut fs in filesystems {
+            runtime.block_on(async {
+                let info = load_info(fs.as_mut()).await.unwrap();
+                assert_eq!(info.illustration, illustration);
+                for &(name, bytes) in entries {
+                    assert!(fs.exists(name).await.unwrap());
+                    assert_eq!(fs.load_file(name).await.unwrap(), bytes, "file: {name}");
+                    assert_eq!(fs.clone_box().load_file(name).await.unwrap(), bytes, "cloned file: {name}");
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn multiple_images_are_preserved_and_fallback_is_stable() {
+        let mut entries: Vec<(&str, &[u8])> = vec![
+            ("z-texture.png", b"root texture"),
+            ("images/deep/texture.webp", b"nested texture"),
+            ("custom.pec", b"chart"),
+            ("music.ogg", b"music"),
+            ("a-cover.JPG", b"cover"),
+            ("texture.bmp", b"another root texture"),
+        ];
+        check_media(&entries, "a-cover.JPG");
+        entries.reverse();
+        check_media(&entries, "a-cover.JPG");
+    }
+
+    #[test]
+    fn declared_illustration_takes_priority_over_other_images() {
+        check_media(&[
+            ("custom.pec", b"chart"),
+            ("music.ogg", b"music"),
+            ("a-texture.png", b"texture"),
+            ("z-cover.png", b"cover"),
+            ("images/texture.webp", b"nested texture"),
+            ("info.yml", b"chart: custom.pec\nmusic: music.ogg\nillustration: z-cover.png\n"),
+        ], "z-cover.png");
+    }
+
+    #[test]
+    fn missing_declared_illustration_accepts_multiple_images() {
+        check_media(&[
+            ("custom.pec", b"chart"),
+            ("music.ogg", b"music"),
+            ("z-texture.png", b"texture"),
+            ("a-cover.png", b"cover"),
+            ("info.yml", b"chart: custom.pec\nmusic: music.ogg\nillustration: missing.png\n"),
+        ], "a-cover.png");
+    }
+
+    #[test]
+    fn rpe_meta_illustration_takes_priority_over_other_images() {
+        check_media(&[
+            ("custom.json", br#"{"META":{"name":"Test","level":"IN 12","background":"z-cover.png","charter":"Test","song":"music.ogg"}}"#),
+            ("music.ogg", b"music"),
+            ("a-texture.png", b"texture"),
+            ("z-cover.png", b"cover"),
+            ("images/texture.webp", b"nested texture"),
+        ], "z-cover.png");
+    }
+
+    #[test]
+    fn default_illustration_takes_priority_over_other_images() {
+        check_media(&[
+            ("custom.pec", b"chart"),
+            ("music.ogg", b"music"),
+            ("a-texture.png", b"texture"),
+            ("background.png", b"default cover"),
+        ], "background.png");
+    }
+
+    #[test]
+    fn single_image_is_still_inferred() {
+        check_media(&[
+            ("custom.pec", b"chart"),
+            ("music.ogg", b"music"),
+            ("cover.WeBp", b"cover"),
+        ], "cover.WeBp");
+    }
+
+    #[test]
+    fn missing_images_keep_the_default_illustration() {
+        check_media(&[
+            ("custom.pec", b"chart"),
+            ("music.ogg", b"music"),
+        ], "background.png");
+    }
+
+    #[test]
+    fn non_image_file_inference_still_rejects_ambiguity() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let cases: [(&str, &[(&str, &[u8])]); 3] = [
+            ("chart", &[("a.json", b"chart"), ("b.pec", b"chart")]),
+            ("audio", &[("custom.pec", b"chart"), ("a.ogg", b"audio"), ("b.mp3", b"audio")]),
+            ("description", &[("a.yml", b"name: A"), ("b.yaml", b"name: B")]),
+        ];
+        for (kind, entries) in cases {
+            let (_directory, filesystems) = media_filesystems(entries);
+            for mut fs in filesystems {
+                let error = runtime.block_on(load_info(fs.as_mut())).err().unwrap();
+                assert!(error.to_string().contains(&format!("candidate {kind} files")), "{error}");
+                assert!(error.to_string().contains("expected exactly one"), "{error}");
+            }
+        }
+    }
 
     fn archive(prefix: &str, directories: bool, finder_metadata: bool, declared_info: bool) -> Vec<u8> {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
