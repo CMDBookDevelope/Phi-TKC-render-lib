@@ -577,7 +577,9 @@ async fn parse_judge_line(
     ) -> Result<AnimFloat> {
         let anis: Vec<_> = event_layers
             .iter()
-            .filter_map(|it| get(it).as_ref().map(|es| parse_events(r, es, None, bezier_map)))
+            // Empty layers add zero. An empty Anim at the head of a chain
+            // hides later layers; at its tail it has no value to add.
+            .filter_map(|it| get(it).as_ref().filter(|es| !es.is_empty()).map(|es| parse_events(r, es, None, bezier_map)))
             .collect::<Result<_>>()
             .with_context(|| ptl!("type-events-parse-failed", "type" => desc))?;
         let mut res = AnimFloat::chain(anis);
@@ -821,4 +823,60 @@ pub async fn parse_rpe(source: &str, fs: &mut dyn FileSystem, extra: ChartExtra)
     chart.block_areas = block_areas;
     chart.noise_skins = std::cell::RefCell::new(noise_skins);
     Ok(chart)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line_with_layers(layers: serde_json::Value) -> JudgeLine {
+        let line = serde_json::from_value(serde_json::json!({
+            "Name": "Empty event layers", "Texture": "line.png", "isCover": 1,
+            "eventLayers": layers, "notes": []
+        })).unwrap();
+        let mut bpm = BpmList::new(vec![(0., 120.)]);
+        let mut fs = crate::fs::fs_from_assets("").unwrap();
+        futures::executor::block_on(parse_judge_line(
+            &mut bpm, line, 10., fs.as_mut(), &HashMap::new(), &mut HashMap::new(),
+        )).unwrap()
+    }
+
+    fn constant(value: f32) -> serde_json::Value {
+        serde_json::json!([{
+            "startTime": [0, 0, 1], "endTime": [2, 0, 1], "start": value,
+            "end": value, "easingType": 1
+        }])
+    }
+
+    #[test]
+    fn empty_first_alpha_layer_keeps_explicit_transparency() {
+        let mut line = line_with_layers(serde_json::json!([
+            { "alphaEvents": [] }, { "alphaEvents": constant(0.) },
+            { "alphaEvents": constant(0.) }, { "alphaEvents": constant(0.) }
+        ]));
+        for time in [0., 0.5, 2., 60.] {
+            line.object.alpha.set_time(time);
+            assert_eq!(line.object.alpha.now_opt(), Some(0.));
+        }
+    }
+
+    #[test]
+    fn empty_middle_and_last_layers_do_not_break_additive_tracks() {
+        let mut line = line_with_layers(serde_json::json!([
+            { "alphaEvents": constant(51.), "moveXEvents": constant(100.),
+              "rotateEvents": constant(30.) },
+            { "alphaEvents": [], "moveXEvents": [], "rotateEvents": [] },
+            { "alphaEvents": constant(102.), "moveXEvents": constant(200.),
+              "rotateEvents": constant(60.) },
+            { "alphaEvents": [], "moveXEvents": [], "rotateEvents": [] }, null
+        ]));
+        for time in [0., 0.5, 2., 60.] {
+            line.object.alpha.set_time(time);
+            line.object.translation.set_time(time);
+            line.object.rotation.set_time(time);
+            assert!((line.object.alpha.now_opt().unwrap() - 0.6).abs() < 1e-6);
+            assert!((line.object.translation.0.now() - 600. / RPE_WIDTH).abs() < 1e-6);
+            assert_eq!(line.object.rotation.now(), -90.);
+        }
+    }
 }
