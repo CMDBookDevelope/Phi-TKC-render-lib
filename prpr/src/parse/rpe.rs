@@ -14,6 +14,7 @@ use crate::{
 use anyhow::{Context, Result};
 use macroquad::prelude::Color;
 use serde::Deserialize;
+mod noise;
 use image::{codecs::gif, AnimationDecoder, DynamicImage};
 use std::{collections::HashMap, time::Duration};
 use crate::ext::SafeTexture;
@@ -252,6 +253,10 @@ struct RPEChart {
     #[serde(rename = "BPMList")]
     bpm_list: Vec<RPEBpmItem>,
     judge_line_list: Vec<RPEJudgeLine>,
+    #[serde(default)]
+    block_area_list: Option<Vec<noise::RpeBlockArea>>,
+    #[serde(default)]
+    noise_area_layers: Option<Vec<noise::RpeNoiseLayer>>,
 }
 
 type BezierMap = HashMap<(u16, i16, i16), Arc<dyn TweenFunction>>;
@@ -756,6 +761,7 @@ pub async fn parse_rpe(source: &str, fs: &mut dyn FileSystem, extra: ChartExtra)
     let rpe: RPEChart = serde_json::from_str(source).with_context(|| ptl!("json-parse-failed"))?;
     let bezier_map = get_bezier_map(&rpe);
     let mut r = BpmList::new(rpe.bpm_list.into_iter().map(|it| (it.start_time.beats(), it.bpm)).collect());
+    let (block_areas, noise_skins) = noise::parse(&r, rpe.block_area_list.unwrap_or_default(), rpe.noise_area_layers, fs).await?;
     let mut texture_cache = std::collections::HashMap::new();
     fn vec<T>(v: &Option<Vec<T>>) -> impl Iterator<Item = &T> {
         v.iter().flat_map(|it| it.iter())
@@ -811,5 +817,8 @@ pub async fn parse_rpe(source: &str, fs: &mut dyn FileSystem, extra: ChartExtra)
         );
     }
     process_lines(&mut lines);
-    Ok(Chart::new(rpe.meta.offset as f32 / 1000.0, lines, r, ChartSettings::default(), extra))
+    let mut chart = Chart::new(rpe.meta.offset as f32 / 1000.0, lines, r, ChartSettings::default(), extra);
+    chart.block_areas = block_areas;
+    chart.noise_skins = std::cell::RefCell::new(noise_skins);
+    Ok(chart)
 }

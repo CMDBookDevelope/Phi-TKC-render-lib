@@ -67,6 +67,7 @@ pub struct Chart {
     pub attach_ui: [Option<usize>; 7],
     /// Phigros 9th-chapter 噪域 (`blockAreaList`). Empty for every older chart.
     pub block_areas: Vec<BlockArea>,
+    pub(crate) noise_skins: RefCell<Vec<super::block_skin::NoiseSkin>>,
     block_frame: RefCell<BlockFrame>,
     world_positions: Vec<Vector>,
     local_states: Vec<LineLocalState>,
@@ -104,6 +105,7 @@ impl Chart {
             order,
             attach_ui,
             block_areas: Vec::new(),
+            noise_skins: RefCell::new(Vec::new()),
             block_frame: RefCell::default(),
             world_positions: Vec::with_capacity(capacity),
             local_states: Vec::with_capacity(capacity),
@@ -339,6 +341,13 @@ impl Chart {
         self.block_zones(res).to_vec()
     }
 
+    pub fn draw_rpe_block_effect(&self, mut scene: Texture2D, time: f64, aspect: f32, dst: (f32, f32, f32, f32)) {
+        let mut skins = self.noise_skins.borrow_mut();
+        for (layer, skin) in skins.iter_mut().enumerate() {
+            if let Some(result) = skin.draw(&self.block_areas, layer, scene, time, aspect, dst) { scene = result; }
+        }
+    }
+
     /// Whether this chart has any 噪域 at all.
     pub fn has_block_areas(&self) -> bool {
         !self.block_areas.is_empty()
@@ -358,6 +367,7 @@ impl Chart {
                     timeline
                         .at(&self.block_areas, now)
                         .iter()
+                        .filter(|&&id| self.block_areas[id].animation.is_none())
                         .filter_map(|&id| Zone::from_area(&self.block_areas[id], now, res.aspect_ratio)),
                 );
                 cache.key = Some(key);

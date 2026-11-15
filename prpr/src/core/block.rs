@@ -62,6 +62,9 @@ pub struct BlockArea {
     pub rotate_events: Vec<BlockRotateEvent>,
     pub move_events: Vec<BlockMoveEvent>,
     pub scale_events: Vec<BlockScaleEvent>,
+    /// RPE Next has independent interval tracks in logical canvas coordinates.
+    /// Official PGR keyframes retain the original path above.
+    pub animation: Option<Box<super::block_animation::BlockAnimation>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -128,7 +131,7 @@ impl BlockArea {
     pub fn phase(&self, t: f64) -> BlockPhase {
         if t < self.appear_time || t >= self.disappear_time {
             BlockPhase::Hidden
-        } else if t >= self.enable_time && t < self.disable_time {
+        } else if self.is_active(t) {
             BlockPhase::Active
         } else {
             BlockPhase::Disabled
@@ -136,6 +139,9 @@ impl BlockArea {
     }
 
     pub fn is_active(&self, t: f64) -> bool {
+        if let Some(animation) = &self.animation {
+            return animation.is_active(t);
+        }
         self.enable_time <= t && t < self.disable_time
     }
 
@@ -202,6 +208,9 @@ impl BlockArea {
     /// segment, then adds `moveTarget - originalCenter`. The first keyframe
     /// sets size/angle without orbiting the center.
     pub fn transform(&self, t: f64, aspect: f32) -> BlockTransform {
+        if let Some(animation) = &self.animation {
+            return animation.transform(t, aspect);
+        }
         let bl = pct_to_chart(self.bottom_left, aspect);
         let tr = pct_to_chart(self.top_right, aspect);
         let base_size = tr - bl;
@@ -362,6 +371,7 @@ mod tests {
         rotate_events: Vec<BlockRotateEvent>,
     ) -> BlockArea {
         BlockArea {
+            animation: None,
             top_right: Vector::new(tr.0, tr.1),
             bottom_left: Vector::new(bl.0, bl.1),
             appear_time: 0.,
@@ -385,6 +395,7 @@ mod tests {
     fn matches_official_move_scale_rotate() {
         let aspect = 16.0f32 / 9.0;
         let b = BlockArea {
+            animation: None,
             top_right: Vector::new(0.6, 0.7),
             bottom_left: Vector::new(0.4, 0.3),
             appear_time: 0.,

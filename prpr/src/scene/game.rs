@@ -2037,6 +2037,7 @@ impl Scene for GameScene {
                         tm.now() as f32,
                         (-1., -ui.top, 2., ui.top * 2.),
                     );
+                    self.chart.draw_rpe_block_effect(texture, self.res.time as f64, self.res.aspect_ratio, (-1., -ui.top, 2., ui.top * 2.));
                 }
             }
             if has_block_effect {

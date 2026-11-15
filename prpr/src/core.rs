@@ -22,6 +22,8 @@ pub use block::{
 mod block_effect;
 pub use block_effect::{draw as draw_block_effect, Zone};
 mod block_timeline;
+pub(crate) mod block_animation;
+pub(crate) mod block_skin;
 
 mod chart;
 pub use chart::{Chart, ChartExtra, ChartSettings};

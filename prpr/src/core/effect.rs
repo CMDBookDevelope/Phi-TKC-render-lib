@@ -268,7 +268,7 @@ const FIRST_MATERIAL_TEXTURE_BINDING: u32 = 3;
 /// GLSL for Vulkan has no loose uniforms, and the block has to list its
 /// members in exactly the order `MaterialParams::uniforms` does because both
 /// sides lay it out as std140.
-fn uniform_block(uniforms: &[(String, UniformType)]) -> String {
+pub(super) fn uniform_block(uniforms: &[(String, UniformType)]) -> String {
     let mut members =
         String::from("    mat4 Projection;\n    mat4 Model;\n    vec4 _Time;\n");
     for (name, its_type) in uniforms {
