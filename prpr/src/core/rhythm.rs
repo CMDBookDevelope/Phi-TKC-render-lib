@@ -284,6 +284,7 @@ pub struct RhythmStrip {
     /// Max endpoint of preceding holds, for bounded sustained-note searches.
     hold_max_end: Vec<f32>,
     palette: [Color; 3],
+    auto_palette: [Color; 3],
     speed: f32,
 }
 
@@ -375,6 +376,7 @@ impl RhythmStrip {
             holds,
             hold_max_end,
             palette,
+            auto_palette: palette,
             speed: 1.,
         }
     }
@@ -384,6 +386,15 @@ impl RhythmStrip {
     }
     pub fn palette(&self) -> [Color; 3] {
         self.palette
+    }
+
+    /// Preserve valid user colors exactly; omitted or invalid overrides restore
+    /// the same automatic palette used by the one-click extraction API.
+    pub fn with_colors(mut self, colors: Option<&[String; 3]>) -> Self {
+        self.palette = colors.and_then(|colors| {
+            Some([parse_hex_color(&colors[0])?, parse_hex_color(&colors[1])?, parse_hex_color(&colors[2])?])
+        }).unwrap_or(self.auto_palette);
+        self
     }
     pub fn beat_at(&self, time: f32) -> f32 {
         self.tempo.beat(time)
@@ -708,6 +719,33 @@ fn glyph_unit_vertices(shape: RhythmShape) -> impl Iterator<Item = lyon::math::P
 // Oklab matrices: https://bottosson.github.io/posts/oklab/
 const MIN_ACCENT_DISTANCE: f32 = 0.16;
 
+/// Extract exactly the hexadecimal colors used by automatic rhythm rendering.
+pub fn extract_cover_palette(cover: &[u8]) -> Result<[String; 3]> {
+    let cover = image::load_from_memory(cover)
+        .context("failed to decode chart illustration for rhythm colors")?
+        .to_rgba8();
+    Ok(cover_palette(Some(&cover)).map(color_hex))
+}
+
+fn color_hex(color: Color) -> String {
+    let [r, g, b] = [color.r, color.g, color.b].map(|channel| (channel.clamp(0., 1.) * 255.).round() as u8);
+    format!("#{r:02X}{g:02X}{b:02X}")
+}
+
+fn parse_hex_color(value: &str) -> Option<Color> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 7 || bytes[0] != b'#' || !bytes[1..].iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let channel = |start| u8::from_str_radix(&value[start..start + 2], 16).ok().map(|value| value as f32 / 255.);
+    Some(Color::new(channel(1)?, channel(3)?, channel(5)?, 1.))
+}
+
+fn quantized_color(color: Color) -> Color {
+    let [r, g, b] = [color.r, color.g, color.b].map(|channel| (channel.clamp(0., 1.) * 255.).round() as u8 as f32 / 255.);
+    Color::new(r, g, b, 1.)
+}
+
 pub fn cover_palette(cover: Option<&RgbaImage>) -> [Color; 3] {
     let fallback = Color::new(0.56, 0.75, 0.96, 1.);
     let Some(cover) = cover.filter(|image| image.width() > 0 && image.height() > 0) else {
@@ -728,7 +766,7 @@ pub fn cover_palette(cover: Option<&RgbaImage>) -> [Color; 3] {
     }
     let samples: Vec<_> = small.pixels().filter(|pixel| pixel[3] > 0).map(|pixel| {
         let color = Color::new(pixel[0] as f32 / 255., pixel[1] as f32 / 255., pixel[2] as f32 / 255., 1.);
-        (color, oklab(color))
+        (color, oklab(color), pixel[3] as f32 / 255.)
     }).collect();
     let mut sources: Vec<Color> = color_thief::get_palette(small.as_raw(), color_thief::ColorFormat::Rgba, 1, 10)
         .unwrap_or_default()
@@ -741,7 +779,28 @@ pub fn cover_palette(cover: Option<&RgbaImage>) -> [Color; 3] {
             (lab_distance(closest.1, center) <= 0.06).then_some(closest.0)
         })
         .collect();
-    sources.push(Color::new(average[0] / weight, average[1] / weight, average[2] / weight, 1.));
+    if sources.is_empty() {
+        let center = oklab(Color::new(average[0] / weight, average[1] / weight, average[2] / weight, 1.));
+        if let Some(sample) = samples.iter().min_by(|a, b| lab_distance(a.1, center).total_cmp(&lab_distance(b.1, center))) {
+            sources.push(sample.0);
+        }
+    }
+    // Color Thief excludes pure white and low-opacity pixels. Retain a real
+    // light/dark source cluster when it covers a meaningful part of the image,
+    // rather than inserting an average color absent from a two-color cover.
+    for lightest in [false, true] {
+        let sample = if lightest {
+            samples.iter().max_by(|a, b| a.1[0].total_cmp(&b.1[0]))
+        } else {
+            samples.iter().min_by(|a, b| a.1[0].total_cmp(&b.1[0]))
+        };
+        if let Some(sample) = sample {
+            let population: f32 = samples.iter().filter(|other| lab_distance(sample.1, other.1) <= 0.06).map(|other| other.2).sum();
+            if population >= weight * 0.05 {
+                sources.push(sample.0);
+            }
+        }
+    }
     separated_accents(&sources)
 }
 
@@ -773,38 +832,35 @@ fn palette_thumbnail(cover: &RgbaImage) -> RgbaImage {
 }
 
 fn separated_accents(sources: &[Color]) -> [Color; 3] {
-    // All accents share a readable perceptual lightness band. Gamut mapping
-    // lowers chroma, preserving the hue rather than clipping RGB channels.
+    // Keep the illustration's natural lightness, chroma, and neutral colors.
+    // A source already separated from earlier accents wins over any variant.
     let normalized: Vec<_> = sources.iter().copied().map(visible_accent).collect();
-    let first = normalized[0];
+    let first = normalized.first().copied().unwrap_or_else(|| quantized_color(Color::new(0.56, 0.75, 0.96, 1.)));
     let lab = oklab(first);
     let hue = lab[2].atan2(lab[1]);
-    let mut derived = Vec::with_capacity(72);
-    for light in [0.72, 0.78, 0.84] {
-        for step in 0..24 {
-            let angle = hue + step as f32 * std::f32::consts::TAU / 24.;
-            derived.push(gamut_mapped(light, 0.20, angle));
-        }
-    }
+    let chroma = if lab[1].hypot(lab[2]) < 0.002 { 0. } else { lab[1].hypot(lab[2]) };
+    // If the cover has fewer than three distinguishable colors, vary only the
+    // same source hue's lightness. Do not invent complementary green/orange.
+    let derived: Vec<_> = [0.30, 0.36, 0.42, 0.48, 0.54, 0.60, 0.66, 0.72, 0.78, 0.84, 0.90, 0.96]
+        .into_iter().map(|light| quantized_color(gamut_mapped(light, chroma, hue))).collect();
     let mut accents = [first; 3];
     for index in 1..3 {
         let prior = &accents[..index];
         let score = |color: Color| prior.iter().map(|&other| distance(color, other)).fold(f32::INFINITY, f32::min);
-        let source = normalized.iter().copied().max_by(|a, b| score(*a).total_cmp(&score(*b))).unwrap();
+        let source = normalized.iter().copied().max_by(|a, b| score(*a).total_cmp(&score(*b))).unwrap_or(first);
         accents[index] = if score(source) >= MIN_ACCENT_DISTANCE {
             source
         } else {
             derived.iter().copied().max_by(|a, b| score(*a).total_cmp(&score(*b))).unwrap()
         };
     }
-    // The normal source-anchored path is checked after sRGB gamut mapping.
-    // An explicit, non-random safety palette keeps the guarantee even if a
-    // future candidate-generation change introduces an infeasible pair.
+    // Check after u8 quantization, which the extraction API and renderer share.
+    // The bounded fallback also stays in the same source hue/neutral family.
     if (1..3).any(|i| (0..i).any(|j| distance(accents[i], accents[j]) < MIN_ACCENT_DISTANCE)) {
         return [
-            Color::new(0.96, 0.48, 0.53, 1.),
-            Color::new(0.36, 0.81, 0.54, 1.),
-            Color::new(0.43, 0.63, 0.99, 1.),
+            quantized_color(gamut_mapped(0.30, chroma, hue)),
+            quantized_color(gamut_mapped(0.63, chroma, hue)),
+            quantized_color(gamut_mapped(0.96, chroma, hue)),
         ];
     }
     accents
@@ -812,11 +868,13 @@ fn separated_accents(sources: &[Color]) -> [Color; 3] {
 
 fn visible_accent(color: Color) -> Color {
     let lab = oklab(color);
-    let chroma = lab[1].hypot(lab[2]);
-    // A neutral cover has no authored hue. Use the same deterministic cool
-    // anchor as a missing cover; no invisible transparent RGB or random seed.
-    let hue = if chroma < 0.025 { 250_f32.to_radians() } else { lab[2].atan2(lab[1]) };
-    gamut_mapped(0.76, if chroma < 0.025 { 0.14 } else { chroma.min(0.20) }, hue)
+    if lab[0] >= 0.30 {
+        return quantized_color(color);
+    }
+    // Only near-black source colors need a minimal visibility adjustment;
+    // ordinary shadows and all other natural source colors remain untouched.
+    let chroma = if lab[1].hypot(lab[2]) < 0.002 { 0. } else { lab[1].hypot(lab[2]) };
+    quantized_color(gamut_mapped(0.30, chroma, lab[2].atan2(lab[1])))
 }
 
 fn gamut_mapped(light: f32, chroma: f32, hue: f32) -> Color {
@@ -1418,7 +1476,7 @@ mod tests {
             assert_eq!(accents, cover_palette(Some(&image)));
             for color in accents {
                 assert!([color.r, color.g, color.b, color.a].into_iter().all(|value| value.is_finite() && (0. ..=1.).contains(&value)));
-                assert!((0.699..=0.861).contains(&oklab(color)[0]));
+                assert!(oklab(color)[0] >= 0.295);
             }
             for i in 1..3 { for j in 0..i {
                 assert!(distance(accents[i], accents[j]) >= MIN_ACCENT_DISTANCE, "near-identical cover accents: {accents:?}");
@@ -1436,6 +1494,85 @@ mod tests {
         let red = RgbaImage::from_pixel(20, 20, image::Rgba([180, 45, 20, 255]));
         assert_eq!(cover_palette(Some(&image([0, 255, 0, 0]))), cover_palette(Some(&image([0, 0, 255, 0]))));
         assert_eq!(cover_palette(Some(&image([0, 255, 0, 0]))), cover_palette(Some(&red)));
+    }
+
+    #[test]
+    fn rhythm_colors_automatic_palette_preserves_three_real_source_colors() {
+        for source_colors in [
+            [[60, 61, 83], [226, 222, 233], [140, 134, 160]],
+            [[170, 34, 34], [34, 153, 68], [34, 51, 187]],
+        ] {
+            let image = RgbaImage::from_fn(96, 32, |x, _| {
+                let [r, g, b] = source_colors[(x / 32) as usize];
+                image::Rgba([r, g, b, 255])
+            });
+            let palette = cover_palette(Some(&image));
+            let actual: std::collections::HashSet<_> = palette.into_iter().map(color_hex).collect();
+            let expected: std::collections::HashSet<_> = source_colors.into_iter()
+                .map(|[r, g, b]| format!("#{r:02X}{g:02X}{b:02X}")).collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn rhythm_colors_neutral_sources_keep_their_shade_and_generate_only_gray_variants() {
+        let mut first_colors = Vec::new();
+        for gray in [0, 80, 156, 200, 255] {
+            let image = RgbaImage::from_pixel(24, 24, image::Rgba([gray, gray, gray, 255]));
+            let palette = cover_palette(Some(&image));
+            if gray > 0 {
+                assert_eq!(palette[0], Color::new(gray as f32 / 255., gray as f32 / 255., gray as f32 / 255., 1.));
+            }
+            for color in palette {
+                assert!((color.r - color.g).abs() <= 1. / 255.);
+                assert!((color.g - color.b).abs() <= 1. / 255.);
+            }
+            first_colors.push(color_hex(palette[0]));
+        }
+        first_colors.sort();
+        first_colors.dedup();
+        assert_eq!(first_colors.len(), 5);
+    }
+
+    #[test]
+    fn rhythm_colors_hex_extraction_matches_automatic_and_manual_renderer_palette_exactly() {
+        use std::io::Cursor;
+        let image = RgbaImage::from_fn(96, 32, |x, _| {
+            image::Rgba([[60, 61, 83, 255], [226, 222, 233, 255], [140, 134, 160, 255]][(x / 32) as usize])
+        });
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image.clone()).write_to(&mut encoded, image::ImageOutputFormat::Png).unwrap();
+        let colors = extract_cover_palette(encoded.get_ref()).unwrap();
+        let auto = RhythmStrip::from_events(BpmList::default(), Vec::new(), cover_palette(Some(&image)));
+        let automatic = auto.palette();
+        assert_eq!(colors, automatic.map(color_hex));
+        assert_eq!(auto.with_colors(Some(&colors)).palette(), automatic);
+        assert!(extract_cover_palette(b"not an image").is_err());
+    }
+
+    #[test]
+    fn rhythm_colors_config_defaults_and_exact_overrides_round_trip_with_safe_reset() {
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.rhythm_colors, None);
+        let colors = ["#010203".to_string(), "#aAbBcC".to_string(), "#000000".to_string()];
+        let mut config = legacy;
+        config.rhythm_colors = Some(colors.clone());
+        let saved = serde_json::to_string(&config).unwrap();
+        let restored: Config = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.rhythm_colors, Some(colors.clone()));
+        let initial = || RhythmStrip::from_events(BpmList::default(), Vec::new(), cover_palette(None));
+        let automatic = initial().palette();
+        let overridden = initial().with_colors(restored.rhythm_colors.as_ref());
+        assert_eq!(overridden.palette(), [
+            Color::new(1. / 255., 2. / 255., 3. / 255., 1.),
+            Color::new(170. / 255., 187. / 255., 204. / 255., 1.),
+            Color::new(0., 0., 0., 1.),
+        ]);
+        assert_eq!(overridden.with_colors(None).palette(), automatic);
+        for invalid in ["#123", "112233", "#12345678", "#GGHHII", "#é0000"] {
+            let bad = [colors[0].clone(), invalid.to_string(), colors[2].clone()];
+            assert_eq!(initial().with_colors(Some(&bad)).palette(), automatic);
+        }
     }
 
 }

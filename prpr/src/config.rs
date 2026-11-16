@@ -101,6 +101,8 @@ pub struct Config {
     pub rhythm_flick: bool,
     /// Visual timeline speed only; musical tempo and hit times are unchanged.
     pub rhythm_speed: f32,
+    /// Exact #RRGGBB accents, or automatic colors from the chart illustration.
+    pub rhythm_colors: Option<[String; 3]>,
 
     // for compatibility
     pub autoplay: Option<bool>,
@@ -173,6 +175,7 @@ impl Default for Config {
             rhythm_hold: true,
             rhythm_flick: false,
             rhythm_speed: 1.,
+            rhythm_colors: None,
 
             ui_score: true,
             ui_combo: true,
