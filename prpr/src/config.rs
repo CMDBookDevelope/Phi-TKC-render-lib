@@ -93,6 +93,12 @@ pub struct Config {
     /// cover it. Off by default: the reference renderer keeps the HUD under the
     /// effect.
     pub block_area_ui: bool,
+    /// Append the rhythm analysis strip to exported video.
+    pub rhythm_analysis: bool,
+    pub rhythm_tap: bool,
+    pub rhythm_drag: bool,
+    pub rhythm_hold: bool,
+    pub rhythm_flick: bool,
 
     // for compatibility
     pub autoplay: Option<bool>,
@@ -159,6 +165,11 @@ impl Default for Config {
             score_aim: false,
             block_area_simple: true,
             block_area_ui: false,
+            rhythm_analysis: false,
+            rhythm_tap: true,
+            rhythm_drag: false,
+            rhythm_hold: true,
+            rhythm_flick: false,
 
             ui_score: true,
             ui_combo: true,

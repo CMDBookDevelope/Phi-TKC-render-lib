@@ -428,6 +428,13 @@ pub fn parse_phigros(source: &str, extra: ChartExtra) -> Result<Chart> {
     for (index, judge_line) in pgr.judge_line_list.iter().enumerate() {
         bpm_values.push((index as f32, judge_line.bpm));
     }
+    // PGR has independent constant BPM values per line, not a global tempo
+    // track. Use the first populated line as the analysis grid, while keeping
+    // the line-index BPM table used by the original renderer unchanged.
+    let rhythm_bpm = pgr.judge_line_list.iter()
+        .find(|line| !line.notes_above.is_empty() || !line.notes_below.is_empty())
+        .or_else(|| pgr.judge_line_list.first())
+        .map_or(120., |line| line.bpm);
 
     let max_time = *pgr
         .judge_line_list
@@ -453,6 +460,7 @@ pub fn parse_phigros(source: &str, extra: ChartExtra) -> Result<Chart> {
 
     process_lines(&mut lines);
     let mut chart = Chart::new(pgr.offset, lines, BpmList::new_time(bpm_values), ChartSettings::default(), extra);
+    chart.rhythm_bpm_list = Some(BpmList::new(vec![(0., rhythm_bpm)]));
     // Block-area times are authored in seconds (the official runtime compares
     // them directly against the song time), so no beat conversion is applied.
     chart.block_areas = parse_block_areas(pgr.block_area_list);

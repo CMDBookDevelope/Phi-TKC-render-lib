@@ -61,6 +61,9 @@ pub struct Chart {
     pub offset: f32,
     pub lines: Vec<JudgeLine>,
     pub bpm_list: RefCell<BpmList>,
+    /// PGR's ordinary BPM list indexes judge lines rather than song time.
+    /// Only the analysis strip uses this optional musical time map.
+    pub rhythm_bpm_list: Option<BpmList>,
     pub settings: ChartSettings,
     pub extra: ChartExtra,
     pub order: Vec<usize>,
@@ -99,6 +102,7 @@ impl Chart {
             offset,
             lines,
             bpm_list: RefCell::new(bpm_list),
+            rhythm_bpm_list: None,
             settings,
             extra,
 

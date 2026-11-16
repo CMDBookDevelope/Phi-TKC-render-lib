@@ -1487,6 +1487,9 @@ impl GameScene {
 }
 
 impl Scene for GameScene {
+    fn chart_time(&self) -> Option<f32> {
+        Some(self.res.time)
+    }
     fn enter(&mut self, tm: &mut TimeManager, target: Option<RenderTarget>) -> Result<()> {
         #[cfg(target_arch = "wasm32")]
         on_game_start();

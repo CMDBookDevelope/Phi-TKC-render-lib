@@ -313,6 +313,11 @@ pub fn return_file(id: String, file: String) {
 }
 
 pub trait Scene {
+    /// Current note-judgement time, after the scene has applied chart offset
+    /// and playback speed. Export overlays must share this clock.
+    fn chart_time(&self) -> Option<f32> {
+        None
+    }
     fn enter(&mut self, _tm: &mut TimeManager, _target: Option<RenderTarget>) -> Result<()> {
         Ok(())
     }

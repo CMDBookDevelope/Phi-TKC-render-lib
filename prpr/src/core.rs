@@ -28,6 +28,9 @@ pub(crate) mod block_skin;
 mod chart;
 pub use chart::{Chart, ChartExtra, ChartSettings};
 
+pub mod rhythm;
+pub use rhythm::{RhythmLayout, RhythmNoteSelection, RhythmStrip};
+
 mod effect;
 pub use effect::{Effect, Uniform};
 
@@ -43,6 +46,9 @@ pub use object::{CtrlObject, Object};
 
 mod render;
 pub use render::{begin_readback_cycle, MSRenderTarget};
+
+mod rhythm_composite;
+pub use rhythm_composite::RhythmComposite;
 
 mod resource;
 pub use resource::{NoteStyle, ParticleEmitter, ResPackInfo, Resource, ResourcePack, DPI_VALUE};
