@@ -270,6 +270,7 @@ pub enum RhythmKind {
 #[derive(Clone, Debug)]
 pub struct RhythmNote {
     pub time: f32,
+    pub end_time: f32,
     pub beat: f32,
     pub end_beat: f32,
     pub kind: RhythmKind,
@@ -339,7 +340,8 @@ impl RhythmStrip {
                 }
             }
             let beat = tempo.beat(time);
-            let end_beat = longest_hold.map_or(beat, |end| tempo.beat(end).max(beat));
+            let end_time = longest_hold.unwrap_or(time);
+            let end_beat = tempo.beat(end_time).max(beat);
             if longest_hold.is_some() {
                 kind = RhythmKind::Hold;
             }
@@ -349,7 +351,7 @@ impl RhythmStrip {
                 // No following global onset can establish the terminal value.
                 next_beat.map_or(RhythmValue::Quarter, |end| RhythmValue::classify_span(beat, end))
             };
-            notes.push(RhythmNote { time, beat, end_beat, kind, value });
+            notes.push(RhythmNote { time, end_time, beat, end_beat, kind, value });
             begin = end;
         }
         let holds: Vec<_> = notes
@@ -403,8 +405,15 @@ impl RhythmStrip {
         self.speed
     }
 
-    fn pitch(&self, top: f32) -> f32 {
-        spacing(top) * self.speed
+    fn time_pitch(&self, top: f32) -> f32 {
+        // A constant seconds-to-pixels scale keeps authored note motion
+        // continuous through tempo changes. The first BPM preserves the old
+        // default layout for charts whose tempo stays constant.
+        spacing(top) * (self.bpm_at(0.) / 60.).max(0.001) * self.speed
+    }
+
+    fn time_position_x(&self, authored_time: f32, time: f32, top: f32) -> f32 {
+        -1. + 2.4 * top + (authored_time - time) * self.time_pitch(top)
     }
 
     // Later judgements paint first, so an earlier note remains above any
@@ -445,8 +454,7 @@ impl RhythmStrip {
     /// x is normalized to the strip's -1..1 camera. At `note.time`, x is
     /// precisely the same judgement line used for the beat reference marks.
     pub fn position_x(&self, note: &RhythmNote, time: f32, top: f32) -> f32 {
-        let judge = -1. + 2.4 * top;
-        judge + (note.beat - self.beat_at(time)) * self.pitch(top)
+        self.time_position_x(note.time, time, top)
     }
 
     /// Draw inside a dedicated Ui/camera viewport whose size is W × W/10.
@@ -457,18 +465,20 @@ impl RhythmStrip {
         let top = ui.top;
         let h = 2. * top;
         let left = -1. + h;
-        let judge = left + 0.2 * h;
-        let pitch = self.pitch(top);
+        let judge = -1. + 2.4 * top;
+        let pitch = self.time_pitch(top);
         let now = self.beat_at(time);
+        let pulse = metronome_pulse(now);
         let bg = mix(self.palette[0], Color::new(0.035, 0.043, 0.06, 1.), 0.88);
         ui.fill_rect(ui.screen_rect(), (mix(bg, self.palette[1], 0.10), (-1., -top), bg, (1., top)));
         ui.fill_rect(Rect::new(-1., -top, 2., h * 0.014), alpha(WHITE, 0.19));
         ui.fill_rect(Rect::new(left, -top, 2. - h, h), (alpha(WHITE, 0.065), (left, -top), alpha(WHITE, 0.), (left, top)));
 
-        // The metronome face and rings stay constant through every beat.
+        // Every real beat has the same luminous peak, independent of meter.
+        // Only brightness pulses; all ring and halo dimensions stay fixed.
         let cx = -1. + top;
         let radius = h * 0.345;
-        ui.fill_circle(cx, 0., radius * 1.16, alpha(self.palette[0], 0.08));
+        ui.fill_circle(cx, 0., radius * 1.16, alpha(self.palette[0], 0.035 + pulse * 0.09));
         ui.fill_circle(cx, 0., radius, (alpha(WHITE, 0.055), (cx, -radius), alpha(WHITE, 0.012), (cx, radius)));
         ui.stroke_circle(cx, 0., radius, h * 0.008, alpha(WHITE, 0.15));
         for layer in 0..4 {
@@ -478,10 +488,10 @@ impl RhythmStrip {
                 0.,
                 radius + extra,
                 h * 0.01 + extra * 0.45,
-                alpha(self.palette[0], 0.16 - layer as f32 * 0.03),
+                alpha(self.palette[0], pulse * (0.28 - layer as f32 * 0.055)),
             );
         }
-        ui.stroke_circle(cx, 0., radius, h * 0.013, alpha(mix(self.palette[0], WHITE, 0.65), 0.65));
+        ui.stroke_circle(cx, 0., radius, h * 0.013, alpha(mix(self.palette[0], WHITE, 0.65), 0.2 + pulse * 0.75));
         text(ui, "BPM", cx, -h * 0.14, h * 1.1, alpha(WHITE, 0.58));
         let bpm = self.bpm_at(time);
         let bpm_text = if (bpm - bpm.round()).abs() < 0.05 {
@@ -500,11 +510,11 @@ impl RhythmStrip {
         // the label band, including when future notes overlap each other.
         ui.scissor(Some(bands.notes));
         // Guide beats sit behind both sustain bands and note heads.
-        let first_beat = (now + (left - judge) / pitch).floor() as i64;
-        let last_beat = (now + (1. - judge) / pitch).ceil() as i64;
+        let first_beat = self.beat_at(time + (left - judge) / pitch).floor() as i64;
+        let last_beat = self.beat_at(time + (1. - judge) / pitch).ceil() as i64;
         let dash_width = (h * 0.012).max(2. / ui.viewport.2.max(1) as f32);
         for beat in first_beat..=last_beat {
-            let x = judge + (beat as f32 - now) * pitch;
+            let x = self.time_position_x(self.tempo.time_beats(beat as f32), time, top);
             for dash in beat_dashes(bands.notes, x, dash_width) {
                 ui.fill_rect(dash, alpha(mix(self.palette[0], WHITE, 0.82), 0.62));
             }
@@ -512,8 +522,8 @@ impl RhythmStrip {
         ui.fill_rect(Rect::new(left, -h * 0.003, 1. - left, h * 0.006), alpha(WHITE, 0.05));
 
         let note_margin = bands.notes.h * NOTE_HEIGHT_RATIO / 1.5 * 1.27;
-        let first = now + (left - judge - note_margin) / pitch;
-        let last = now + (1. - judge + note_margin) / pitch;
+        let first = self.beat_at(time + (left - judge - note_margin) / pitch);
+        let last = self.beat_at(time + (1. - judge + note_margin) / pitch);
         // Soft line glow never obscures the note glyph, which is drawn last.
         for layer in 0..3 {
             let w = h * (0.023 - layer as f32 * 0.007);
@@ -523,7 +533,7 @@ impl RhythmStrip {
         text(ui, "RHYTHM", left + h * 0.12, -h * 0.40, h * 0.84, alpha(WHITE, 0.36));
 
         for note in self.visible_notes(first, last) {
-            let x = judge + (note.beat - now) * pitch;
+            let x = self.position_x(note, time, top);
             let (shape, color) = note.value.style();
             let (y, radius) = note_geometry(shape, bands.notes);
             let c = self.palette[color];
@@ -531,7 +541,7 @@ impl RhythmStrip {
             // hold also stays above every later note it overlaps.
             if note.end_beat > note.beat {
                 let start = x.max(left - radius);
-                let tail = (judge + (note.end_beat - now) * pitch).min(1. + radius);
+                let tail = self.time_position_x(note.end_time, time, top).min(1. + radius);
                 if tail > start {
                     ui.fill_rect(
                         Rect::new(start, y - radius * 0.32, tail - start, radius * 0.64),
@@ -571,7 +581,7 @@ impl RhythmStrip {
         let end = self.notes.partition_point(|note| note.beat <= last);
         for index in (begin.min(end)..end).rev() {
             let note = &self.notes[index];
-            let x = judge + (note.beat - now) * pitch;
+            let x = self.position_x(note, time, top);
             text(ui, &note.value.label(), x, bands.label_y, bands.label_size, alpha(WHITE, 0.86));
         }
         ui.scissor(None);
@@ -580,6 +590,17 @@ impl RhythmStrip {
 
 fn spacing(top: f32) -> f32 {
     ((2. - 2.4 * top - 0.08) / 6.).max(0.01)
+}
+
+fn metronome_pulse(beat: f32) -> f32 {
+    if !beat.is_finite() {
+        return 0.;
+    }
+    // Converting an authored integer beat to seconds and back can land one
+    // ulp below the integer. Snap only that quantization interval to the peak.
+    let tolerance = 2. * f32::EPSILON * beat.abs().max(1.);
+    let phase = if (beat - beat.round()).abs() <= tolerance { 0. } else { beat.rem_euclid(1.) };
+    (-phase * 20.).exp()
 }
 
 const NOTE_HEIGHT_RATIO: f32 = 0.90;
@@ -961,7 +982,7 @@ mod tests {
         ] {
             strip.set_speed(input);
             assert_eq!(strip.speed(), expected);
-            assert!(strip.pitch(0.1).is_finite() && strip.pitch(0.1) > 0.);
+            assert!(strip.time_pitch(0.1).is_finite() && strip.time_pitch(0.1) > 0.);
         }
     }
 
@@ -1087,6 +1108,90 @@ mod tests {
         for invalid in [f32::NAN, f32::INFINITY, 0., -1.] {
             assert_eq!(RhythmValue::classify(invalid).label(), "4");
         }
+    }
+
+    #[test]
+    fn rhythm_132_time_axis_guides_follow_actual_tempo_density() {
+        let strip = strip(Vec::new(), BpmList::new(vec![(0., 120.), (4., 180.), (10., 90.)]));
+        let top = 0.1;
+        let guide = |beat| strip.time_position_x(strip.tempo.time_beats(beat), 1., top);
+        let medium_gap = guide(2.) - guide(1.);
+        let dense_gap = guide(6.) - guide(5.);
+        let sparse_gap = guide(12.) - guide(11.);
+        assert!((medium_gap / dense_gap - 1.5).abs() < 0.00001);
+        assert!((sparse_gap / medium_gap - 4. / 3.).abs() < 0.00001);
+        assert!(dense_gap < medium_gap && medium_gap < sparse_gap);
+        assert_eq!(strip.bpm_at(0.), 120.);
+        assert_eq!(strip.bpm_at(2.001), 180.);
+        assert_eq!(strip.bpm_at(4.001), 90.);
+        let judge = -1. + 2.4 * top;
+        for beat in 0..20 {
+            let time = strip.tempo.time_beats(beat as f32);
+            assert!((strip.time_position_x(time, time, top) - judge).abs() < 0.000001);
+        }
+    }
+
+    #[test]
+    fn rhythm_132_time_axis_heads_and_hold_tails_cross_tempo_nodes_continuously() {
+        let strip = strip(
+            vec![(1.5, 5.5, RhythmKind::Hold), (3., 3., RhythmKind::Tap), (4.5, 4.5, RhythmKind::Tap)],
+            BpmList::new(vec![(0., 120.), (4., 180.), (10., 90.)]),
+        );
+        let top = 0.1;
+        let epsilon = 0.001;
+        assert_eq!(strip.notes()[0].end_time, 5.5);
+        for boundary in [2., 4.] {
+            for note in strip.notes() {
+                let before = strip.position_x(note, boundary - epsilon, top);
+                let at = strip.position_x(note, boundary, top);
+                let after = strip.position_x(note, boundary + epsilon, top);
+                assert!((before - at - epsilon * strip.time_pitch(top)).abs() < 0.000001);
+                assert!((at - after - epsilon * strip.time_pitch(top)).abs() < 0.000001);
+                let tail_before = strip.time_position_x(note.end_time, boundary - epsilon, top);
+                let tail_after = strip.time_position_x(note.end_time, boundary + epsilon, top);
+                assert!((tail_before - tail_after - 2. * epsilon * strip.time_pitch(top)).abs() < 0.000001);
+                let first_time = boundary - 0.2;
+                let last_time = boundary + 0.2;
+                let visible: Vec<_> = strip.visible_notes(strip.beat_at(first_time), strip.beat_at(last_time))
+                    .map(|note| note.time).collect();
+                assert!(visible.contains(&1.5)); // off-screen hold head, visible authored tail
+            }
+        }
+        for note in strip.notes() {
+            assert!((strip.position_x(note, note.time, top) - (-1. + 2.4 * top)).abs() < 0.000001);
+        }
+    }
+
+    #[test]
+    fn rhythm_132_time_axis_constant_tempo_preserves_previous_default_spacing() {
+        for bpm in [90., 120., 180.] {
+            let mut strip = strip(vec![(1., 1., RhythmKind::Tap)], BpmList::new(vec![(0., bpm)]));
+            for speed in [0.1, 1., 10.] {
+                strip.set_speed(speed);
+                let note = &strip.notes()[0];
+                let time = 0.4;
+                let top = 0.1;
+                let previous = -1. + 2.4 * top + (note.beat - strip.beat_at(time)) * spacing(top) * speed;
+                assert!((strip.position_x(note, time, top) - previous).abs() < 0.000001);
+            }
+        }
+    }
+
+    #[test]
+    fn rhythm_132_time_axis_every_authored_beat_has_the_same_pulse_peak() {
+        let tempo = BpmList::new(vec![(0., 120.), (4., 180.), (10., 90.)]);
+        for beat in -4..80 {
+            let time = tempo.time_beats(beat as f32);
+            assert_eq!(metronome_pulse(tempo.beat(time)), 1., "beat {beat}, time {time}");
+            for phase in [0.125, 0.25, 0.5] {
+                let time = tempo.time_beats(beat as f32 + phase);
+                assert!((metronome_pulse(tempo.beat(time)) - (-phase * 20.).exp()).abs() < 0.00001);
+            }
+        }
+        assert!(metronome_pulse(3.9999) < 0.00001); // snap only the tiny float quantization interval
+        let slow_period = tempo.time_beats(12.) - tempo.time_beats(11.);
+        let fast_period = tempo.time_beats(6.) - tempo.time_beats(5.);
+        assert!((slow_period / fast_period - 2.).abs() < 0.00001);
     }
 
     #[test]
