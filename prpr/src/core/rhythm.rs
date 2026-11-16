@@ -554,7 +554,7 @@ impl RhythmBands {
             notes: Rect::new(left, -h * 0.5, 1. - left, h * 0.68),
             labels: Rect::new(left, h * 0.20, 1. - left, h * 0.30),
             label_y: h * 0.35,
-            label_size: h * 1.8,
+            label_size: h * 3.6,
         }
     }
 }
@@ -897,7 +897,7 @@ mod tests {
             assert!(y + radius * 0.32 < bands.labels.y); // sustain width
             assert!(bands.label_y > bands.labels.y);
             assert!(bands.label_y < bands.labels.y + bands.labels.h);
-            assert!(bands.label_size > h * 0.9); // larger than the previous text
+            assert_eq!(bands.label_size, h * 3.6); // readable Saira caps in the exported video
         }
     }
 
