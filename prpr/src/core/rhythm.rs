@@ -49,7 +49,7 @@ impl RhythmNoteSelection {
     }
 }
 
-/// Video codecs require even dimensions. Round W/7 to the nearest even pixel,
+/// Video codecs require even dimensions. Round W/10 to the nearest even pixel,
 /// leaving the original game rectangle exactly W × H.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RhythmLayout {
@@ -62,7 +62,7 @@ pub struct RhythmLayout {
 impl RhythmLayout {
     pub fn new(width: u32, height: u32, enabled: bool) -> Result<Self> {
         ensure!(width >= 16 && height >= 16 && width % 2 == 0 && height % 2 == 0, "video width and height must be even and at least 16");
-        let strip_height = if enabled { (((width as u64 + 7) / 14) * 2).max(2) } else { 0 };
+        let strip_height = if enabled { (((width as u64 + 10) / 20) * 2).max(2) } else { 0 };
         let output_height = height as u64 + strip_height;
         ensure!(width <= i32::MAX as u32 && output_height <= i32::MAX as u64, "rhythm output dimensions exceed the graphics viewport limit");
         Ok(Self {
@@ -226,8 +226,6 @@ pub struct RhythmNote {
     pub end_beat: f32,
     pub kind: RhythmKind,
     pub value: RhythmValue,
-    pub chord_slot: usize,
-    pub chord_count: usize,
 }
 
 pub struct RhythmStrip {
@@ -237,6 +235,7 @@ pub struct RhythmStrip {
     /// Max endpoint of preceding holds, for bounded sustained-note searches.
     hold_max_end: Vec<f32>,
     palette: [Color; 3],
+    speed: f32,
 }
 
 impl RhythmStrip {
@@ -279,7 +278,7 @@ impl RhythmStrip {
             }
             let beat = tempo.beat(time);
             let gap = events.get(end).map(|event| tempo.beat(event.0) - beat);
-            for (slot, &(time, end_time, kind)) in events[begin..end].iter().enumerate() {
+            for &(time, end_time, kind) in &events[begin..end] {
                 let beat = tempo.beat(time);
                 let end_beat = if kind == RhythmKind::Hold && end_time.is_finite() {
                     tempo.beat(end_time).max(beat)
@@ -299,8 +298,6 @@ impl RhythmStrip {
                     end_beat,
                     kind,
                     value,
-                    chord_slot: slot,
-                    chord_count: end - begin,
                 });
             }
             begin = end;
@@ -326,6 +323,7 @@ impl RhythmStrip {
             holds,
             hold_max_end,
             palette,
+            speed: 1.,
         }
     }
 
@@ -342,14 +340,66 @@ impl RhythmStrip {
         self.tempo.now_bpm(time)
     }
 
+    pub fn with_speed(mut self, speed: f32) -> Self {
+        self.set_speed(speed);
+        self
+    }
+
+    pub fn set_speed(&mut self, speed: f32) {
+        self.speed = if speed.is_finite() { speed.clamp(0.1, 10.) } else { 1. };
+    }
+
+    pub fn speed(&self) -> f32 {
+        self.speed
+    }
+
+    fn pitch(&self, top: f32) -> f32 {
+        spacing(top) * self.speed
+    }
+
+    // Later judgements paint first, so an earlier note remains above any
+    // overlapping future note. Stable source order breaks exact-time ties.
+    fn visible_notes(&self, first: f32, last: f32) -> impl Iterator<Item = &RhythmNote> {
+        let begin = self.notes.partition_point(|note| note.beat < first);
+        let end = self.notes.partition_point(|note| note.beat <= last);
+        let mut heads = (begin.min(end)..end).rev().peekable();
+        let hold_begin = self.hold_max_end.partition_point(|&end| end < first);
+        let hold_end = self.holds.partition_point(|&index| self.notes[index].beat <= last);
+        let mut holds = self.holds[hold_begin.min(hold_end)..hold_end].iter().rev().copied().peekable();
+        // Merge the two descending index streams without allocating or
+        // scanning expired tap notes behind a still-active long hold.
+        std::iter::from_fn(move || {
+            let index = match (heads.peek().copied(), holds.peek().copied()) {
+                (Some(head), Some(hold)) if head >= hold => {
+                    heads.next();
+                    if head == hold {
+                        holds.next();
+                    }
+                    head
+                }
+                (Some(_), Some(hold)) | (None, Some(hold)) => {
+                    holds.next();
+                    hold
+                }
+                (Some(head), None) => {
+                    heads.next();
+                    head
+                }
+                (None, None) => return None,
+            };
+            Some(&self.notes[index])
+        })
+        .filter(move |note| note.beat >= first || note.end_beat >= first)
+    }
+
     /// x is normalized to the strip's -1..1 camera. At `note.time`, x is
     /// precisely the same judgement line used for the beat reference marks.
     pub fn position_x(&self, note: &RhythmNote, time: f32, top: f32) -> f32 {
         let judge = -1. + 2.4 * top;
-        judge + (note.beat - self.beat_at(time)) * spacing(top)
+        judge + (note.beat - self.beat_at(time)) * self.pitch(top)
     }
 
-    /// Draw inside a dedicated Ui/camera viewport whose size is W × W/7.
+    /// Draw inside a dedicated Ui/camera viewport whose size is W × W/10.
     /// No music offset, playback speed, or preroll is applied here: the caller
     /// has already resolved those in the scene's judgement clock.
     pub fn draw(&self, chart_time: f32, ui: &mut Ui) {
@@ -358,7 +408,7 @@ impl RhythmStrip {
         let h = 2. * top;
         let left = -1. + h;
         let judge = left + 0.2 * h;
-        let pitch = spacing(top);
+        let pitch = self.pitch(top);
         let now = self.beat_at(time);
         let phase = now.rem_euclid(1.);
         let pulse = (-phase * 20.).exp();
@@ -396,60 +446,55 @@ impl RhythmStrip {
         text(ui, "BEAT", cx, h * 0.18, h * 0.83, alpha(self.palette[0], 0.8));
         ui.fill_rect(Rect::new(left, -top + h * 0.10, h * 0.004, h * 0.80), alpha(WHITE, 0.16));
 
-        ui.scissor(Some(Rect::new(left, -top, 1. - left, h)));
+        let bands = RhythmBands::new(left, h);
+        ui.fill_rect(bands.labels, alpha(Color::new(0.02, 0.025, 0.035, 1.), 0.58));
+        ui.fill_rect(Rect::new(left, bands.labels.y, 1. - left, h * 0.003), alpha(WHITE, 0.08));
+        // Note heads, their glows, and hold tails are physically clipped above
+        // the label band, including when future notes overlap each other.
+        ui.scissor(Some(bands.notes));
         // Guide beats sit behind both sustain bands and note heads.
         let first_beat = (now + (left - judge) / pitch).floor() as i64;
         let last_beat = (now + (1. - judge) / pitch).ceil() as i64;
         for beat in first_beat..=last_beat {
             let x = judge + (beat as f32 - now) * pitch;
             let strong = beat.rem_euclid(4) == 0;
-            ui.fill_rect(Rect::new(x - h * 0.0015, -h * 0.27, h * 0.003, h * 0.54), alpha(WHITE, if strong { 0.13 } else { 0.075 }));
-            ui.fill_circle(x, h * 0.37, h * 0.006, alpha(WHITE, if strong { 0.25 } else { 0.10 }));
+            ui.fill_rect(Rect::new(x - h * 0.0015, -h * 0.27, h * 0.003, h * 0.42), alpha(WHITE, if strong { 0.13 } else { 0.075 }));
+            ui.fill_circle(x, -h * 0.30, h * 0.006, alpha(WHITE, if strong { 0.25 } else { 0.10 }));
         }
         ui.fill_rect(Rect::new(left, -h * 0.003, 1. - left, h * 0.006), alpha(WHITE, 0.05));
 
         let first = now + (left - judge - h * 0.15) / pitch;
         let last = now + (1. - judge + h * 0.15) / pitch;
-        let begin = self.notes.partition_point(|note| note.beat < first);
-        let end = self.notes.partition_point(|note| note.beat <= last);
-        // Holds may have their head off-screen while the authored tail remains
-        // visible. The prefix endpoint search retains these sustained notes.
-        let hold_begin = self.hold_max_end.partition_point(|&end| end < first);
-        let hold_end = self.holds.partition_point(|&index| self.notes[index].beat <= last);
-        for &index in &self.holds[hold_begin.min(hold_end)..hold_end] {
-            let note = &self.notes[index];
-            let (y, radius) = chord_geometry(note, h);
-            let x = judge + (note.beat - now) * pitch;
-            let tail = judge + (note.end_beat - now) * pitch;
-            let c = self.palette[note.value.style().1];
-            let x = x.max(left - radius);
-            let tail = tail.min(1. + radius);
-            if tail > x {
-                ui.fill_rect(
-                    Rect::new(x, y - radius * 0.32, tail - x, radius * 0.64),
-                    (alpha(c, 0.32), (x, y - radius * 0.32), alpha(c, 0.12), (x, y + radius * 0.32)),
-                );
-                ui.fill_rect(Rect::new(x, y - radius * 0.05, tail - x, radius * 0.10), alpha(c, 0.62));
-                ui.fill_circle(tail, y, radius * 0.27, alpha(c, 0.7));
-            }
-        }
-
         // Soft line glow never obscures the note glyph, which is drawn last.
         for layer in 0..3 {
             let w = h * (0.023 - layer as f32 * 0.007);
-            ui.fill_rect(Rect::new(judge - w * 0.5, -h * 0.31, w, h * 0.62), alpha(self.palette[0], 0.07 + pulse * 0.055));
+            ui.fill_rect(Rect::new(judge - w * 0.5, -h * 0.31, w, h * 0.46), alpha(self.palette[0], 0.07 + pulse * 0.055));
         }
-        ui.fill_rect(Rect::new(judge - h * 0.0025, -h * 0.33, h * 0.005, h * 0.66), alpha(WHITE, 0.72));
+        ui.fill_rect(Rect::new(judge - h * 0.0025, -h * 0.33, h * 0.005, h * 0.49), alpha(WHITE, 0.72));
         ui.fill_circle(judge, -h * 0.36, h * 0.010, alpha(WHITE, 0.68));
 
-        for note in &self.notes[begin.min(end)..end] {
+        for note in self.visible_notes(first, last) {
             let x = judge + (note.beat - now) * pitch;
-            let (y, radius) = chord_geometry(note, h);
+            let (y, radius) = note_geometry(h);
+            let (shape, color) = note.value.style();
+            let c = self.palette[color];
+            // Paint each whole note together (tail, then head), so an earlier
+            // hold also stays above every later note it overlaps.
+            if note.end_beat > note.beat {
+                let start = x.max(left - radius);
+                let tail = (judge + (note.end_beat - now) * pitch).min(1. + radius);
+                if tail > start {
+                    ui.fill_rect(
+                        Rect::new(start, y - radius * 0.32, tail - start, radius * 0.64),
+                        (alpha(c, 0.32), (start, y - radius * 0.32), alpha(c, 0.12), (start, y + radius * 0.32)),
+                    );
+                    ui.fill_rect(Rect::new(start, y - radius * 0.05, tail - start, radius * 0.10), alpha(c, 0.62));
+                    ui.fill_circle(tail, y, radius * 0.27, alpha(c, 0.7));
+                }
+            }
             if x + radius < left || x - radius > 1. {
                 continue;
             }
-            let (shape, color) = note.value.style();
-            let c = self.palette[color];
             let hit = (1. - (time - note.time).abs() / 0.07).max(0.);
             glyph(ui, shape, x, y + radius * 0.07, radius * 1.07, alpha(Color::new(0., 0., 0., 1.), 0.35));
             glyph(ui, shape, x, y, radius * (1.14 + hit * 0.13), alpha(c, 0.12 + hit * 0.18));
@@ -469,13 +514,21 @@ impl RhythmStrip {
                 RhythmKind::Hold => ui.fill_rect(Rect::new(x - radius * 0.24, y - radius * 0.06, radius * 0.48, radius * 0.12), alpha(WHITE, 0.72)),
                 RhythmKind::Tap => {}
             }
-            // Chords preserve every head at its true x, with compact vertical
-            // spacing. One label per chord avoids overlapping repeated text.
-            if note.chord_slot == 0 {
-                text(ui, note.value.label(), x, h * 0.30, h * 0.9, alpha(WHITE, 0.62));
-            }
         }
         text(ui, "RHYTHM", left + h * 0.12, -h * 0.40, h * 0.84, alpha(WHITE, 0.36));
+        ui.scissor(Some(bands.labels));
+        // Labels are painted after every note, in a dedicated larger band.
+        // Identical onsets need one readable label, not repeated overprinting.
+        let begin = self.notes.partition_point(|note| note.beat < first);
+        let end = self.notes.partition_point(|note| note.beat <= last);
+        for index in (begin.min(end)..end).rev() {
+            let note = &self.notes[index];
+            if index > 0 && (note.time - self.notes[index - 1].time).abs() < 0.0001 {
+                continue;
+            }
+            let x = judge + (note.beat - now) * pitch;
+            text(ui, note.value.label(), x, bands.label_y, bands.label_size, alpha(WHITE, 0.86));
+        }
         ui.scissor(None);
     }
 }
@@ -484,15 +537,26 @@ fn spacing(top: f32) -> f32 {
     ((2. - 2.4 * top - 0.08) / 6.).max(0.01)
 }
 
-fn chord_geometry(note: &RhythmNote, h: f32) -> (f32, f32) {
-    let count = note.chord_count.max(1) as f32;
-    if count == 1. {
-        return (0., h * 0.112);
+fn note_geometry(h: f32) -> (f32, f32) {
+    (-h * 0.02, h * 0.112)
+}
+
+struct RhythmBands {
+    notes: Rect,
+    labels: Rect,
+    label_y: f32,
+    label_size: f32,
+}
+
+impl RhythmBands {
+    fn new(left: f32, h: f32) -> Self {
+        Self {
+            notes: Rect::new(left, -h * 0.5, 1. - left, h * 0.68),
+            labels: Rect::new(left, h * 0.20, 1. - left, h * 0.30),
+            label_y: h * 0.35,
+            label_size: h * 1.8,
+        }
     }
-    let step = h * 0.38 / (count - 1.);
-    let y = (note.chord_slot as f32 - (count - 1.) * 0.5) * step;
-    let radius = (h * 0.095).min(step * 0.43);
-    (y, radius)
 }
 
 fn text(ui: &mut Ui, value: &str, x: f32, y: f32, size: f32, color: Color) {
@@ -512,6 +576,13 @@ fn glyph(ui: &mut Ui, shape: RhythmShape, x: f32, y: f32, radius: f32, color: Co
         ui.fill_circle(x, y, radius, color);
         return;
     }
+    ui.fill_path(&glyph_path(shape, x, y, radius), color);
+    if shape == RhythmShape::DoubleTriangle {
+        ui.fill_circle(x, y + radius * 0.16, radius * 0.16, alpha(WHITE, 0.8));
+    }
+}
+
+fn glyph_path(shape: RhythmShape, x: f32, y: f32, radius: f32) -> Path {
     let (vertices, angle) = match shape {
         RhythmShape::Triangle | RhythmShape::DoubleTriangle => (3, -FRAC_PI_2),
         RhythmShape::Diamond => (4, -FRAC_PI_2),
@@ -540,10 +611,7 @@ fn glyph(ui: &mut Ui, shape: RhythmShape, x: f32, y: f32, radius: f32, color: Co
         }
     }
     path.end(true);
-    ui.fill_path(&path.build(), color);
-    if shape == RhythmShape::DoubleTriangle {
-        ui.fill_circle(x, y + radius * 0.16, radius * 0.16, alpha(WHITE, 0.8));
-    }
+    path.build()
 }
 
 /// Quantize a bounded cover thumbnail once, then choose three separated
@@ -644,10 +712,12 @@ mod tests {
     }
 
     #[test]
-    fn extending_video_preserves_original_rectangle_and_codec_alignment() {
+    fn rhythm_adjust_layout_preserves_game_with_one_tenth_extension() {
         let layout = RhythmLayout::new(1920, 1080, true).unwrap();
-        assert_eq!((layout.game_height, layout.strip_height, layout.output_height), (1080, 274, 1354));
-        assert!((layout.judge_x_pixels() - 328.8).abs() < 0.0001);
+        assert_eq!((layout.game_height, layout.strip_height, layout.output_height), (1080, 192, 1272));
+        assert!((layout.judge_x_pixels() - 230.4).abs() < 0.0001);
+        assert_eq!(RhythmLayout::new(320, 180, true).unwrap().output_height, 212);
+        assert_eq!(RhythmLayout::new(1280, 720, true).unwrap().output_height, 848);
         assert_eq!(RhythmLayout::new(16, 16, true).unwrap().strip_height, 2);
         assert_eq!(RhythmLayout::new(1920, 1080, false).unwrap().output_height, 1080);
         assert!(RhythmLayout::new(1919, 1080, true).is_err());
@@ -674,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn chords_do_not_change_onset_value_and_holds_span_tempo_changes() {
+    fn rhythm_adjust_simultaneous_notes_keep_single_onset_values_and_hold_span() {
         let tempo = BpmList::new(vec![(0., 120.), (4., 240.)]);
         let strip = strip(
             vec![
@@ -691,11 +761,143 @@ mod tests {
         assert!((hold.end_beat - hold.beat - 1.5).abs() < 0.00001);
         assert_eq!(strip.notes()[1].value, RhythmValue::Eighth);
         assert_eq!(strip.notes()[2].value, RhythmValue::Eighth);
-        assert_eq!(strip.notes()[0].chord_count, 3);
-        for pair in strip.notes()[..3].windows(2) {
-            let (first_y, first_radius) = chord_geometry(&pair[0], 1.);
-            let (second_y, second_radius) = chord_geometry(&pair[1], 1.);
-            assert!(second_y - first_y > first_radius + second_radius, "simultaneous heads must remain independently visible");
+        // Duplicate starts are ordinary overlapping single notes: their tap
+        // values still use the next distinct onset, never a zero-length gap.
+        assert_eq!(strip.notes()[1].value, strip.notes()[2].value);
+        assert_eq!(strip.notes()[0].beat, strip.notes()[1].beat);
+    }
+
+    #[test]
+    fn rhythm_adjust_speed_scales_positions_without_changing_tempo_or_judgement() {
+        let tempo = BpmList::new(vec![(0., 120.), (4., 180.)]);
+        let mut strip = strip(vec![(1., 1., RhythmKind::Tap), (2., 2.5, RhythmKind::Hold)], tempo);
+        let notes = strip.notes().to_vec();
+        let top = 0.1;
+        let now = 1.5;
+        let judge = -1. + 2.4 * top;
+        let gap = strip.position_x(&notes[1], now, top) - strip.position_x(&notes[0], now, top);
+        let movement = strip.position_x(&notes[1], now, top) - strip.position_x(&notes[1], now + 0.05, top);
+        for speed in [0.1, 0.5, 1., 2., 10.] {
+            strip.set_speed(speed);
+            for note in &notes {
+                assert!((strip.position_x(note, note.time, top) - judge).abs() < 0.00001);
+                assert!(strip.position_x(note, note.time - 0.01, top) > judge);
+                assert!(strip.position_x(note, note.time + 0.01, top) < judge);
+            }
+            let scaled_gap = strip.position_x(&notes[1], now, top) - strip.position_x(&notes[0], now, top);
+            let scaled_movement = strip.position_x(&notes[1], now, top) - strip.position_x(&notes[1], now + 0.05, top);
+            assert!((scaled_gap - gap * speed).abs() < 0.00001);
+            assert!((scaled_movement - movement * speed).abs() < 0.00001);
+            assert_eq!(strip.bpm_at(now), 120.);
+            assert_eq!(strip.bpm_at(2.1), 180.);
+            assert_eq!(strip.beat_at(now), 3.);
+            assert_eq!(strip.notes()[1].end_beat, notes[1].end_beat);
+        }
+    }
+
+    #[test]
+    fn rhythm_adjust_speed_defaults_and_invalid_boundaries_remain_finite() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.rhythm_speed, 1.);
+        let config: Config = serde_json::from_str(r#"{"rhythmSpeed":2.5}"#).unwrap();
+        assert_eq!(config.rhythm_speed, 2.5);
+        let mut strip = strip(Vec::new(), BpmList::default()).with_speed(config.rhythm_speed);
+        assert_eq!(strip.speed(), 2.5);
+        for (input, expected) in [
+            (0., 0.1),
+            (-2., 0.1),
+            (0.1, 0.1),
+            (10., 10.),
+            (100., 10.),
+            (f32::NAN, 1.),
+            (f32::INFINITY, 1.),
+            (f32::NEG_INFINITY, 1.),
+        ] {
+            strip.set_speed(input);
+            assert_eq!(strip.speed(), expected);
+            assert!(strip.pitch(0.1).is_finite() && strip.pitch(0.1) > 0.);
+        }
+    }
+
+    #[test]
+    fn rhythm_adjust_earlier_judgements_paint_last_on_the_shared_track() {
+        let strip = strip(
+            vec![
+                (0.5, 0.5, RhythmKind::Tap),
+                (0.5, 0.5, RhythmKind::Drag),
+                (1., 1., RhythmKind::Flick),
+                (2., 3., RhythmKind::Hold),
+            ],
+            BpmList::new(vec![(0., 120.)]),
+        );
+        let order: Vec<_> = strip.visible_notes(0., 5.).map(|note| (note.time, note.kind)).collect();
+        assert_eq!(
+            order,
+            vec![
+                (2., RhythmKind::Hold),
+                (1., RhythmKind::Flick),
+                (0.5, RhythmKind::Drag),
+                (0.5, RhythmKind::Tap)
+            ]
+        );
+        let clipped: Vec<_> = strip.visible_notes(2., 4.).map(|note| note.time).collect();
+        assert_eq!(clipped, vec![2., 1.]);
+        assert!(strip.visible_notes(8., 9.).next().is_none());
+    }
+
+    #[test]
+    fn rhythm_adjust_active_hold_and_future_heads_share_earliest_on_top_order() {
+        let strip = strip(
+            vec![
+                (0., 5., RhythmKind::Hold),
+                (0.5, 0.75, RhythmKind::Hold),
+                (1., 1., RhythmKind::Tap),
+                (2., 2., RhythmKind::Flick),
+                (3., 4., RhythmKind::Hold),
+            ],
+            BpmList::new(vec![(0., 120.)]),
+        );
+        // The first hold's head has left the visible region, but its tail must
+        // paint last above later heads; expired short holds stay absent.
+        let order: Vec<_> = strip.visible_notes(3., 8.).map(|note| note.time).collect();
+        assert_eq!(order, vec![3., 2., 0.]);
+        // A visible hold is merged once even though its head and tail both
+        // qualify for the visible region.
+        let order: Vec<_> = strip.visible_notes(0., 8.).map(|note| note.time).collect();
+        assert_eq!(order, vec![3., 2., 1., 0.5, 0.]);
+    }
+
+    #[test]
+    fn rhythm_adjust_all_shapes_glows_and_sustains_leave_label_band_clear() {
+        for h in [0.125, 0.2, 0.4] {
+            let bands = RhythmBands::new(-1. + h, h);
+            let (y, radius) = note_geometry(h);
+            assert!(bands.notes.y + bands.notes.h < bands.labels.y);
+            // All vector glyphs stay inside their radius. The active hit glow
+            // (1.27r) exceeds both the shadow and each type's inner decoration.
+            for value in RhythmValue::ALL {
+                let shape = value.style().0;
+                if shape == RhythmShape::Circle {
+                    assert!(y + radius * 1.27 < bands.notes.y + bands.notes.h);
+                    assert!(y - radius * 1.27 > bands.notes.y);
+                } else {
+                    // Inspect vertices of the actual paths submitted to Ui,
+                    // including stars/crosses and the largest active glow.
+                    for event in glyph_path(shape, 0., y, radius * 1.27).iter() {
+                        let at = match event {
+                            lyon::path::PathEvent::Begin { at } => at,
+                            lyon::path::PathEvent::Line { to, .. } => to,
+                            _ => continue,
+                        };
+                        assert!(at.y >= bands.notes.y && at.y < bands.notes.y + bands.notes.h);
+                        assert!(at.y < bands.labels.y);
+                    }
+                }
+            }
+            assert!(y + radius * 0.32 < bands.labels.y); // sustain width
+            assert!(bands.label_y > bands.labels.y);
+            assert!(bands.label_y < bands.labels.y + bands.labels.h);
+            assert!(bands.label_size > h * 0.9); // larger than the previous text
         }
     }
 

@@ -99,6 +99,8 @@ pub struct Config {
     pub rhythm_drag: bool,
     pub rhythm_hold: bool,
     pub rhythm_flick: bool,
+    /// Visual timeline speed only; musical tempo and hit times are unchanged.
+    pub rhythm_speed: f32,
 
     // for compatibility
     pub autoplay: Option<bool>,
@@ -170,6 +172,7 @@ impl Default for Config {
             rhythm_drag: false,
             rhythm_hold: true,
             rhythm_flick: false,
+            rhythm_speed: 1.,
 
             ui_score: true,
             ui_combo: true,

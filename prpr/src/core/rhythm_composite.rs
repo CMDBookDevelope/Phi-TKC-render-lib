@@ -1,13 +1,16 @@
 //! Append a rhythm strip after the unmodified game render has resolved.
 use super::{MSRenderTarget, RhythmLayout, RhythmStrip};
-use crate::ui::{TextPainter, Ui};
+use crate::ui::{FontArc, TextPainter, Ui};
 use anyhow::Result;
 use macroquad::prelude::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+
+const SAIRA_FONT: &[u8] = include_bytes!("../../assets/fonts/Saira-SemiBold.ttf");
 
 pub struct RhythmComposite {
     pub layout: RhythmLayout,
     strip: Option<RhythmStrip>,
+    strip_painter: Option<RefCell<TextPainter>>,
     targets: Vec<(MSRenderTarget, MSRenderTarget)>,
     last_time: Cell<f32>,
 }
@@ -15,6 +18,13 @@ pub struct RhythmComposite {
 impl RhythmComposite {
     pub fn new(width: u32, height: u32, strip: Option<RhythmStrip>, slots: usize) -> Result<Self> {
         let layout = RhythmLayout::new(width, height, strip.is_some())?;
+        // Keep the glyph cache local to this export's GPU context. Embedding the
+        // licensed font also avoids platform-specific asset paths or fallbacks.
+        let strip_painter = if strip.is_some() {
+            Some(RefCell::new(TextPainter::new(FontArc::try_from_slice(SAIRA_FONT)?)))
+        } else {
+            None
+        };
         let targets = if strip.is_some() {
             (0..slots)
                 .map(|_| (MSRenderTarget::new((width, layout.strip_height), 1), MSRenderTarget::new((width, layout.output_height), 1)))
@@ -25,6 +35,7 @@ impl RhythmComposite {
         Ok(Self {
             layout,
             strip,
+            strip_painter,
             targets,
             last_time: Cell::new(0.),
         })
@@ -32,7 +43,7 @@ impl RhythmComposite {
 
     /// The disabled path returns the original target without any extra draws.
     /// Each in-flight export frame owns its own strip and composite targets.
-    pub fn compose(&self, slot: usize, game: &MSRenderTarget, chart_time: Option<f32>, painter: &mut TextPainter) -> RenderTarget {
+    pub fn compose(&self, slot: usize, game: &MSRenderTarget, chart_time: Option<f32>, _game_painter: &mut TextPainter) -> RenderTarget {
         let Some(strip) = &self.strip else { return game.output() };
         if let Some(time) = chart_time.filter(|time| time.is_finite()) {
             self.last_time.set(time);
@@ -40,7 +51,12 @@ impl RhythmComposite {
         let (strip_target, output_target) = &self.targets[slot];
         unsafe { get_internal_gl() }.flush();
         push_camera_state();
-        let mut ui = Ui::new(painter, Some((0, 0, self.layout.width as i32, self.layout.strip_height as i32)));
+        let mut painter = self
+            .strip_painter
+            .as_ref()
+            .expect("enabled rhythm strip has its own painter")
+            .borrow_mut();
+        let mut ui = Ui::new(&mut painter, Some((0, 0, self.layout.width as i32, self.layout.strip_height as i32)));
         let mut camera = ui.camera();
         camera.render_target = Some(strip_target.input());
         set_camera(&camera);

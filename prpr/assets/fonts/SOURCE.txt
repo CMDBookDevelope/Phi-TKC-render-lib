@@ -1,0 +1,13 @@
+Saira SemiBold (width 100, weight 600)
+Copyright 2020 The Saira Project Authors (https://github.com/Omnibus-Type/Saira)
+Licensed under the SIL Open Font License 1.1; see OFL.txt.
+
+Source: google/fonts, revision 8b0a1d0f5983c89bc2b93f1b5fb55f9e252744b5
+https://github.com/google/fonts/tree/8b0a1d0f5983c89bc2b93f1b5fb55f9e252744b5/ofl/saira
+Original: Saira[wdth,wght].ttf
+Source SHA-256: 9d050fc5a01c85f74c4257c207d50b55d1e40c37308c642f974a2c5003231dde
+
+Static instance generated using FontTools 4.68.0:
+instantiateVariableFont(font, {"wdth": 100, "wght": 600}, inplace=True,
+                        updateFontNames=True)
+All source glyphs and original copyright/license entries are preserved.
