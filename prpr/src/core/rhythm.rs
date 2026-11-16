@@ -603,7 +603,7 @@ fn metronome_pulse(beat: f32) -> f32 {
     (-phase * 20.).exp()
 }
 
-const NOTE_HEIGHT_RATIO: f32 = 0.90;
+const NOTE_HEIGHT_RATIO: f32 = 0.70;
 const NOTE_INNER_RATIO: f32 = 0.92;
 
 fn note_geometry(shape: RhythmShape, notes: Rect) -> (f32, f32) {
@@ -1060,15 +1060,15 @@ mod tests {
                 };
                 for scale in [1., NOTE_INNER_RATIO] {
                     let (min, max) = bounds(scale);
-                    assert!(max - min >= bands.notes.h * 0.8);
+                    assert!((max - min - bands.notes.h * NOTE_HEIGHT_RATIO * scale).abs() < 0.000001);
                     assert!(((min + max) * 0.5 - (bands.notes.y + bands.notes.h * 0.5)).abs() < 0.000001);
                     assert!(min >= bands.notes.y && max <= bands.notes.y + bands.notes.h);
                     assert!(max < bands.labels.y);
                 }
-                // Larger hit glows deliberately reach the clipping boundary;
-                // the production notes scissor keeps that paint out of labels.
+                // The largest hit glow fits the reduced 70% head height; the
+                // production scissor still protects the separate label band.
                 let (min, max) = bounds(1.27);
-                assert!(min < bands.notes.y && max > bands.notes.y + bands.notes.h);
+                assert!(min >= bands.notes.y && max <= bands.notes.y + bands.notes.h);
                 assert!(y - radius * 0.32 > bands.notes.y);
                 assert!(y + radius * 0.32 < bands.notes.y + bands.notes.h);
             }
