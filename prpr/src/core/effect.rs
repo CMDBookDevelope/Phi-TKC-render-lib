@@ -310,19 +310,54 @@ fn vertex_shader(uniforms_block: &str) -> String {
     [VERTEX_SHADER_HEAD, uniforms_block, VERTEX_SHADER_BODY].concat()
 }
 
-/// Move an effect shader onto the GLSL that Vulkan accepts.
+/// Move an effect shader onto the GLSL 450 shared by Vulkan and Metal.
 ///
 /// The loose `uniform` declarations are pulled into `uniforms_block`: the
 /// samplers become separately bound combined image samplers, everything else
-/// becomes a member of the block.
+/// becomes a member of the block. Custom RPE effects may still use ES 100's
+/// varying/texture2D/gl_FragColor syntax even though the built-in effects are 450.
 fn fragment_shader(source: &str, uniforms_block: &str) -> String {
+    // Consume comments and quoted preprocessor text as whole tokens so words
+    // inside them, or inside longer identifiers, are never rewritten.
+    static TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"(?m:^[ \t]*#[ \t]*version[^\r\n]*)|(?s:/\*.*?\*/)|//[^\r\n]*|"(?:\\.|[^"\\])*"|[A-Za-z_][A-Za-z0-9_]*"#).unwrap()
+    });
     static UNIFORM_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"(?m)^uniform\s+(\w+)\s+(\w+);([^\n]*)").unwrap());
+        Lazy::new(|| Regex::new(r"(?s:/\*.*?\*/)|//[^\r\n]*|(?m:^[ \t]*uniform[ \t]+(?:(?:lowp|mediump|highp)[ \t]+)?(\w+)[ \t]+(\w+)[ \t]*;([^\r\n]*))").unwrap());
+    static HEADER_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"\A(?:\s+|//[^\n]*(?:\n|\z)|(?s:/\*.*?\*/)|#[^\n]*(?:\n|\z))*").unwrap()
+    });
+
+    let mut output_name = "prpr_FragColor".to_owned();
+    let mut suffix = 0;
+    while source.contains(&output_name) {
+        suffix += 1;
+        output_name = format!("prpr_FragColor_{suffix}");
+    }
+    let mut needs_output = false;
+    let source = TOKEN_RE.replace_all(source.trim_start_matches('\u{feff}'), |caps: &regex::Captures| {
+        let token = &caps[0];
+        match token {
+            "varying" => "in".to_owned(),
+            "texture2D" | "textureCube" => "texture".to_owned(),
+            "texture2DProj" => "textureProj".to_owned(),
+            "texture2DLod" | "textureCubeLod" => "textureLod".to_owned(),
+            "texture2DProjLod" => "textureProjLod".to_owned(),
+            "gl_FragColor" => {
+                needs_output = true;
+                output_name.clone()
+            }
+            _ if token.trim_start().starts_with('#') => String::new(),
+            _ => token.to_owned(),
+        }
+    });
 
     let mut binding = FIRST_MATERIAL_TEXTURE_BINDING;
-    let mut written = false;
-    UNIFORM_RE
-        .replace_all(source, |caps: &regex::Captures| {
+    let source = UNIFORM_RE
+        .replace_all(&source, |caps: &regex::Captures| {
+            if caps.get(1).is_none() {
+                return caps[0].to_owned();
+            }
             let (its_type, name) = (&caps[1], &caps[2]);
             let tail = &caps[3];
             if its_type.starts_with("sampler") {
@@ -332,12 +367,78 @@ fn fragment_shader(source: &str, uniforms_block: &str) -> String {
                 );
                 binding += 1;
                 decl
-            } else if written {
-                String::new()
             } else {
-                written = true;
-                uniforms_block.to_owned()
+                tail.to_owned()
             }
         })
-        .into_owned()
+        .into_owned();
+
+    // Extensions must precede declarations. Always supply the common block,
+    // including effects that declare only screenTexture or no loose uniforms.
+    let header_end = HEADER_RE.find(&source).unwrap().end();
+    let output = if needs_output {
+        format!("layout(location = 0) out vec4 {output_name};\n")
+    } else {
+        String::new()
+    };
+    format!("#version 450 core\n{}{}{}{}", &source[..header_end], uniforms_block, output, &source[header_end..])
+}
+
+#[cfg(test)]
+mod shader_tests {
+    use super::*;
+
+    const BLOCK: &str = "layout(set = 0, binding = 0) uniform Uniforms { float time; };\n";
+
+    #[test]
+    fn legacy_tokens_preserve_comments_identifiers_and_component_writes() {
+        let shader = fragment_shader(r#"#version 100
+// varying texture2D gl_FragColor
+/*
+uniform float commented;
+#version 100
+*/
+precision mediump float;
+varying vec2 uv;
+    uniform sampler2D screenTexture;
+uniform float time;
+void main() {
+    float texture2DScale = time;
+    gl_FragColor = texture2D(screenTexture, uv) * texture2DScale;
+    gl_FragColor.a = 1.0;
+}"#, BLOCK);
+        assert!(shader.starts_with("#version 450 core\n"));
+        assert!(shader.contains("// varying texture2D gl_FragColor"));
+        assert!(shader.contains("/*\nuniform float commented;\n#version 100\n*/"));
+        assert!(shader.contains("in vec2 uv;"));
+        assert!(shader.contains("layout(set = 0, binding = 3) uniform sampler2D screenTexture;"));
+        assert!(shader.contains("float texture2DScale = time;"));
+        assert!(shader.contains("prpr_FragColor = texture(screenTexture, uv) * texture2DScale;"));
+        assert!(shader.contains("prpr_FragColor.a = 1.0;"));
+        assert_eq!(shader.matches("uniform Uniforms").count(), 1);
+        assert_eq!(shader.matches("out vec4 prpr_FragColor;").count(), 1);
+    }
+
+    #[test]
+    fn modern_effect_keeps_output_and_places_common_block_after_extensions() {
+        let shader = fragment_shader(r#"#version 450 core
+#extension GL_EXT_control_flow_attributes : enable
+layout(location = 0) in vec2 uv;
+layout(location = 0) out vec4 color;
+uniform sampler2D screenTexture;
+void main() { color = texture(screenTexture, uv); }
+"#, BLOCK);
+        assert!(shader.find("#extension").unwrap() < shader.find("uniform Uniforms").unwrap());
+        assert!(shader.contains("color = texture(screenTexture, uv);"));
+        assert!(!shader.contains("prpr_FragColor"));
+        assert_eq!(shader.matches("out vec4").count(), 1);
+        assert_eq!(shader.matches("uniform Uniforms").count(), 1);
+    }
+
+    #[test]
+    fn legacy_output_name_avoids_colliding_with_shader_variables() {
+        let shader = fragment_shader("void main() { vec4 prpr_FragColor = vec4(1.0); gl_FragColor = prpr_FragColor; }", BLOCK);
+        assert!(shader.contains("out vec4 prpr_FragColor_1;"));
+        assert!(shader.contains("prpr_FragColor_1 = prpr_FragColor;"));
+    }
 }

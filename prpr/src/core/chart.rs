@@ -64,6 +64,8 @@ pub struct Chart {
     /// PGR's ordinary BPM list indexes judge lines rather than song time.
     /// Only the analysis strip uses this optional musical time map.
     pub rhythm_bpm_list: Option<BpmList>,
+    /// True only when a musical BPM map was authored, rather than a file-format time ruler.
+    pub rhythm_bpm_authored: bool,
     pub settings: ChartSettings,
     pub extra: ChartExtra,
     pub order: Vec<usize>,
@@ -98,11 +100,13 @@ impl Chart {
         let capacity = lines.len();
         let parents = lines.iter().map(|it| it.parent).collect();
         let position_order = Self::position_order(&lines);
+        let rhythm_bpm_authored = !bpm_list.points().is_empty();
         Self {
             offset,
             lines,
             bpm_list: RefCell::new(bpm_list),
             rhythm_bpm_list: None,
+            rhythm_bpm_authored,
             settings,
             extra,
 

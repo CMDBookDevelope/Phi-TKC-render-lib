@@ -29,6 +29,7 @@ mod chart;
 pub use chart::{Chart, ChartExtra, ChartSettings};
 
 pub mod rhythm;
+mod rhythm_tempo;
 pub use rhythm::{RhythmLayout, RhythmNoteSelection, RhythmStrip};
 
 mod effect;

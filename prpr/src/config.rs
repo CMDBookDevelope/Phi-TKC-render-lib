@@ -95,6 +95,8 @@ pub struct Config {
     pub block_area_ui: bool,
     /// Append the rhythm analysis strip to exported video.
     pub rhythm_analysis: bool,
+    /// Infer musical tempo from decoded audio only when the chart has no BPM map.
+    pub rhythm_auto_bpm: bool,
     pub rhythm_tap: bool,
     pub rhythm_drag: bool,
     pub rhythm_hold: bool,
@@ -170,6 +172,7 @@ impl Default for Config {
             block_area_simple: true,
             block_area_ui: false,
             rhythm_analysis: false,
+            rhythm_auto_bpm: true,
             rhythm_tap: true,
             rhythm_drag: false,
             rhythm_hold: true,

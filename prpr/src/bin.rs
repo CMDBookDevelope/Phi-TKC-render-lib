@@ -462,7 +462,9 @@ impl BinaryData for Chart {
         let mut lines = r.array()?;
         process_lines(&mut lines);
         let settings = r.read()?;
-        Ok(Chart::new(offset, lines, BpmList::new(vec![(0., 60.)]), settings, ChartExtra::default()))
+        let mut chart = Chart::new(offset, lines, BpmList::new(vec![(0., 60.)]), settings, ChartExtra::default());
+        chart.rhythm_bpm_authored = false;
+        Ok(chart)
     }
 
     fn write_binary<W: Write>(&self, w: &mut BinaryWriter<W>) -> Result<()> {

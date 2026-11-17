@@ -7,12 +7,31 @@ use std::cell::{Cell, RefCell};
 
 const SAIRA_FONT: &[u8] = include_bytes!("../../assets/fonts/Saira-SemiBold.ttf");
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct RhythmFrameSample {
+    time: Option<f32>,
+    previous_time: Option<f32>,
+}
+
+impl RhythmFrameSample {
+    fn advance(mut self, chart_time: Option<f32>) -> Self {
+        if let Some(time) = chart_time.filter(|time| time.is_finite()) {
+            if self.time != Some(time) {
+                self.previous_time = self.time;
+                self.time = Some(time);
+            }
+        }
+        // Same-time retries, other slots and Ending reuse the same interval.
+        self
+    }
+}
+
 pub struct RhythmComposite {
     pub layout: RhythmLayout,
     strip: Option<RhythmStrip>,
     strip_painter: Option<RefCell<TextPainter>>,
     targets: Vec<(MSRenderTarget, MSRenderTarget)>,
-    last_time: Cell<f32>,
+    frame_sample: Cell<RhythmFrameSample>,
 }
 
 impl RhythmComposite {
@@ -37,7 +56,7 @@ impl RhythmComposite {
             strip,
             strip_painter,
             targets,
-            last_time: Cell::new(0.),
+            frame_sample: Cell::new(RhythmFrameSample::default()),
         })
     }
 
@@ -45,9 +64,8 @@ impl RhythmComposite {
     /// Each in-flight export frame owns its own strip and composite targets.
     pub fn compose(&self, slot: usize, game: &MSRenderTarget, chart_time: Option<f32>, _game_painter: &mut TextPainter) -> RenderTarget {
         let Some(strip) = &self.strip else { return game.output() };
-        if let Some(time) = chart_time.filter(|time| time.is_finite()) {
-            self.last_time.set(time);
-        }
+        let sample = self.frame_sample.get().advance(chart_time);
+        self.frame_sample.set(sample);
         let (strip_target, output_target) = &self.targets[slot];
         unsafe { get_internal_gl() }.flush();
         push_camera_state();
@@ -61,7 +79,7 @@ impl RhythmComposite {
         camera.render_target = Some(strip_target.input());
         set_camera(&camera);
         clear_background(BLACK);
-        strip.draw(self.last_time.get(), &mut ui);
+        strip.draw_sampled(sample.time.unwrap_or(0.), sample.previous_time, &mut ui);
         unsafe { get_internal_gl() }.flush();
 
         let width = self.layout.width as f32;
@@ -95,5 +113,35 @@ impl RhythmComposite {
         unsafe { get_internal_gl() }.flush();
         pop_camera_state();
         output_target.output()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RhythmFrameSample;
+    use super::super::rhythm::metronome_pulse_sampled;
+
+    #[test]
+    fn rhythm_sampled_composite_retries_slots_and_ending_preserve_peak_interval() {
+        let first = RhythmFrameSample::default().advance(Some(0.499));
+        assert_eq!(first.previous_time, None);
+        let peak = first.advance(Some(0.51));
+        let pulse = |sample: RhythmFrameSample| {
+            let time = sample.time.unwrap_or(0.);
+            metronome_pulse_sampled(time * 2., sample.previous_time.map(|time| time * 2.), sample.previous_time.map_or(0., |previous| time - previous))
+        };
+        assert_eq!(pulse(peak), 1.);
+        for retry in [Some(0.51), None, Some(f32::NAN), Some(f32::INFINITY)] {
+            assert_eq!(peak.advance(retry), peak);
+            assert_eq!(pulse(peak.advance(retry)), 1.);
+        }
+        let next = peak.advance(Some(0.52));
+        assert_eq!(next.previous_time, Some(0.51));
+        assert!(pulse(next) < 1.);
+        let seek = next.advance(Some(2.02));
+        assert!(pulse(seek) < 1.);
+        assert_eq!(seek.advance(None), seek);
+        let backwards = seek.advance(Some(0.2));
+        assert!(pulse(backwards) < 1.);
     }
 }

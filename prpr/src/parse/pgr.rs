@@ -5,12 +5,12 @@ use super::process_lines;
 use crate::{
     core::{
         Anim, AnimFloat, AnimVector, BlockArea, BlockMoveEvent, BlockRotateEvent, BlockScaleEvent, BpmList, Chart, ChartExtra, ChartSettings,
-        JudgeLine, JudgeLineCache, JudgeLineKind, Keyframe, Note, NoteKind, Object, Vector, HEIGHT_RATIO,
+        JudgeLine, JudgeLineCache, JudgeLineKind, Keyframe, Note, NoteKind, Object, Triple, Vector, HEIGHT_RATIO,
     },
     ext::NotNanExt,
     judge::JudgeStatus,
 };
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize};
 use tracing::warn;
 use anyhow::bail;
@@ -118,6 +118,9 @@ struct PgrJudgeLine {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PgrChart {
+    /// Optional authored musical tempo for the rhythm strip only.
+    #[serde(default, rename = "BPMList", alias = "bpmList", alias = "bpmlist")]
+    rhythm_bpm_list: Option<Vec<PgrRhythmBpmItem>>,
     offset: f32,
     judge_line_list: Vec<PgrJudgeLine>,
     /// Phigros 9th-chapter "噪域" / block areas. Absent in every older chart.
@@ -422,6 +425,38 @@ fn parse_judge_line(pgr: PgrJudgeLine, max_time: f32) -> Result<JudgeLine> {
     })
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PgrRhythmBpmItem {
+    start_time: Triple,
+    bpm: f32,
+}
+
+fn parse_rhythm_bpm_list(items: Option<Vec<PgrRhythmBpmItem>>, fallback: f32) -> Result<BpmList> {
+    let Some(items) = items.filter(|items| !items.is_empty()) else {
+        return Ok(BpmList::new(vec![(0., fallback)]));
+    };
+    let mut ranges = Vec::with_capacity(items.len());
+    for (index, item) in items.into_iter().enumerate() {
+        let beat = item.start_time.beats();
+        ensure!(beat.is_finite(), "invalid PGR BPMList entry {index}: beat must be finite");
+        ensure!(
+            item.bpm.is_finite() && item.bpm > 0. && (60. / item.bpm).is_finite(),
+            "invalid PGR BPMList entry {index}: BPM must be finite and positive"
+        );
+        ranges.push((beat, item.bpm));
+    }
+    // Stable sorting preserves the last-authored BPM at a duplicated beat.
+    ranges.sort_by(|a, b| a.0.total_cmp(&b.0));
+    ensure!(ranges[0].0 == 0., "PGR BPMList must begin at beat zero");
+    let tempo = BpmList::new(ranges);
+    ensure!(
+        tempo.points().iter().all(|point| point.1.is_finite()),
+        "PGR BPMList produces a non-finite timestamp"
+    );
+    Ok(tempo)
+}
+
 pub fn parse_phigros(source: &str, extra: ChartExtra) -> Result<Chart> {
     let pgr: PgrChart = serde_json::from_str(source).with_context(|| ptl!("json-parse-failed"))?;
     let mut bpm_values = Vec::new();
@@ -435,6 +470,8 @@ pub fn parse_phigros(source: &str, extra: ChartExtra) -> Result<Chart> {
         .find(|line| !line.notes_above.is_empty() || !line.notes_below.is_empty())
         .or_else(|| pgr.judge_line_list.first())
         .map_or(120., |line| line.bpm);
+    let rhythm_bpm_authored = pgr.rhythm_bpm_list.as_ref().is_some_and(|items| !items.is_empty());
+    let rhythm_bpm_list = parse_rhythm_bpm_list(pgr.rhythm_bpm_list, rhythm_bpm)?;
 
     let max_time = *pgr
         .judge_line_list
@@ -460,9 +497,137 @@ pub fn parse_phigros(source: &str, extra: ChartExtra) -> Result<Chart> {
 
     process_lines(&mut lines);
     let mut chart = Chart::new(pgr.offset, lines, BpmList::new_time(bpm_values), ChartSettings::default(), extra);
-    chart.rhythm_bpm_list = Some(BpmList::new(vec![(0., rhythm_bpm)]));
+    chart.rhythm_bpm_list = Some(rhythm_bpm_list);
+    chart.rhythm_bpm_authored = rhythm_bpm_authored;
     // Block-area times are authored in seconds (the official runtime compares
     // them directly against the song time), so no beat conversion is applied.
     chart.block_areas = parse_block_areas(pgr.block_area_list);
     Ok(chart)
+}
+
+#[cfg(test)]
+mod explicit_rhythm_bpm_tests {
+    use super::*;
+    use crate::core::{RhythmNoteSelection, RhythmStrip};
+    use serde_json::{json, Value};
+
+    const FIXTURE: &str = r#"{"formatVersion":3,"offset":0.125,"BPMList":[{"startTime":[0,0,1],"bpm":120},{"startTime":[4,0,1],"bpm":180},{"startTime":[10,0,1],"bpm":90}],"judgeLineList":[{"bpm":120,"judgeLineDisappearEvents":[{"startTime":0,"endTime":512,"start":0,"end":1}],"judgeLineRotateEvents":[{"startTime":0,"endTime":512,"start":0,"end":90}],"judgeLineMoveEvents":[{"startTime":0,"endTime":512,"start":0.25,"end":0.75,"start2":0.5,"end2":0.5}],"speedEvents":[{"startTime":0,"endTime":512,"value":1}],"notesAbove":[{"type":1,"time":32,"positionX":0,"holdTime":0,"speed":1,"floorPosition":0.5},{"type":3,"time":224,"positionX":0,"holdTime":96,"speed":1,"floorPosition":3.5}],"notesBelow":[]}]}"#;
+
+    fn fixture() -> Value {
+        serde_json::from_str(FIXTURE).unwrap()
+    }
+
+    fn parse(value: &Value) -> Result<Chart> {
+        parse_phigros(&value.to_string(), ChartExtra::default())
+    }
+
+    #[test]
+    fn pgr_rhythm_explicit_bpm_list_updates_all_aliases_without_retiming_game() {
+        let mut baseline_source = fixture();
+        baseline_source.as_object_mut().unwrap().remove("BPMList");
+        let baseline = parse(&baseline_source).unwrap();
+        for alias in ["BPMList", "bpmList", "bpmlist"] {
+            let mut value = fixture();
+            let table = value.as_object_mut().unwrap().remove("BPMList").unwrap();
+            value[alias] = table;
+            let chart = parse(&value).unwrap();
+            assert!(chart.rhythm_bpm_authored);
+            let tempo = chart.rhythm_bpm_list.as_ref().unwrap();
+            assert_eq!(tempo.now_bpm(0.), 120., "{alias}");
+            // The optional table changes rhythm analysis, preserving PGR judgement seconds.
+            assert_eq!(tempo.now_bpm(2.001), 180., "{alias}");
+            assert_eq!(tempo.now_bpm(4.001), 90., "{alias}");
+            assert_eq!(tempo.points(), &[(0., 0., 120.), (4., 2., 180.), (10., 4., 90.)]);
+            assert_eq!(tempo.beat(3.), 7.);
+            assert_eq!(tempo.time_beats(7.), 3.);
+
+            assert_eq!(chart.offset, baseline.offset);
+            assert_eq!(chart.bpm_list.borrow().points(), baseline.bpm_list.borrow().points());
+            assert_eq!(chart.lines[0].notes, baseline.lines[0].notes);
+            assert_eq!(chart.lines[0].object, baseline.lines[0].object);
+            assert_eq!(chart.lines[0].height, baseline.lines[0].height);
+            let tap = chart.lines[0].notes.iter()
+                .find(|note| matches!(note.kind, NoteKind::Click)).unwrap();
+            let hold = chart.lines[0].notes.iter()
+                .find(|note| matches!(note.kind, NoteKind::Hold { .. })).unwrap();
+            assert_eq!(tap.time, 0.5);
+            assert_eq!(hold.time, 3.5);
+            assert!(matches!(
+                hold.kind,
+                NoteKind::Hold { end_time: 5., .. }
+            ));
+            assert_eq!(chart.lines[0].object.alpha.keyframes[1].time, 8.);
+            assert_eq!(chart.lines[0].object.rotation.keyframes[1].time, 8.);
+
+            let strip = RhythmStrip::from_chart(&chart, RhythmNoteSelection::default(), None);
+            assert_eq!(strip.bpm_at(2.001), 180., "{alias}");
+            assert_eq!(strip.bpm_at(4.001), 90., "{alias}");
+            assert_eq!(strip.notes()[1].time, 3.5);
+            assert_eq!(strip.notes()[1].end_time, 5.);
+            assert_eq!(strip.notes()[1].beat, 8.5);
+            assert_eq!(strip.notes()[1].end_beat, 11.5);
+        }
+    }
+
+    #[test]
+    fn pgr_rhythm_explicit_bpm_list_keeps_legacy_fallback_for_missing_null_empty() {
+        for table in [None, Some(Value::Null), Some(json!([]))] {
+            let mut value = fixture();
+            value.as_object_mut().unwrap().remove("BPMList");
+            if let Some(table) = table {
+                value["BPMList"] = table;
+            }
+            let chart = parse(&value).unwrap();
+            assert!(!chart.rhythm_bpm_authored);
+            assert_eq!(chart.rhythm_bpm_list.as_ref().unwrap().points(), &[(0., 0., 120.)]);
+            let tap = chart.lines[0].notes.iter()
+                .find(|note| matches!(note.kind, NoteKind::Click)).unwrap();
+            assert_eq!(tap.time, 0.5);
+        }
+    }
+
+    #[test]
+    fn pgr_rhythm_explicit_bpm_list_stably_sorts_and_last_duplicate_wins() {
+        let mut value = fixture();
+        value["BPMList"] = json!([
+            {"startTime":[10,0,1],"bpm":90},
+            {"startTime":[4,0,1],"bpm":150},
+            {"startTime":[0,0,1],"bpm":120},
+            {"startTime":[3,1,1],"bpm":180}
+        ]);
+        let chart = parse(&value).unwrap();
+        let tempo = chart.rhythm_bpm_list.as_ref().unwrap();
+        assert_eq!(tempo.points(), &[
+            (0., 0., 120.), (4., 2., 150.), (4., 2., 180.), (10., 4., 90.)
+        ]);
+        assert_eq!(tempo.now_bpm(2.), 180.);
+        assert_eq!(tempo.now_bpm(4.), 90.);
+        assert_eq!(tempo.time_beats(7.), 3.);
+    }
+
+    #[test]
+    fn pgr_rhythm_explicit_bpm_list_rejects_invalid_authored_tables() {
+        let invalid = [
+            json!([{"startTime":[0,0,1],"bpm":0}]),
+            json!([{"startTime":[0,0,1],"bpm":-120}]),
+            json!([{"startTime":[0,0,1],"bpm":"120"}]),
+            json!([{"startTime":[0,0,1]}]),
+            json!([{"startTime":[0,0,0],"bpm":120}]),
+            json!([{"startTime":[1,0,1],"bpm":120}]),
+            json!([{"startTime":[-1,0,1],"bpm":120}]),
+            json!([{"startTime":[0,0,1],"bpm":1e-40}]),
+            json!([
+                {"startTime":[0,0,1],"bpm":1e-35},
+                {"startTime":[2147483647,0,1],"bpm":120}
+            ]),
+        ];
+        for table in invalid {
+            let mut value = fixture();
+            value["BPMList"] = table;
+            assert!(parse(&value).is_err(), "accepted invalid table: {}", value["BPMList"]);
+        }
+        let mut ambiguous = fixture();
+        ambiguous["bpmList"] = ambiguous["BPMList"].clone();
+        assert!(parse(&ambiguous).is_err(), "accepted duplicate aliases");
+    }
 }

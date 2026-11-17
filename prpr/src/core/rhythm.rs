@@ -296,8 +296,59 @@ impl RhythmStrip {
         Ok(Self::from_chart(chart, selection, Some(&cover)))
     }
 
+    /// Build the strip on the chart's seconds axis. `audio_offset` is the same
+    /// chart + configuration + metadata offset subtracted by GameScene.
+    pub fn from_chart_bytes_with_audio(
+        chart: &Chart,
+        selection: RhythmNoteSelection,
+        cover: &[u8],
+        music: &sasa::AudioClip,
+        auto_bpm: bool,
+        audio_offset: f32,
+    ) -> Result<Self> {
+        // Authored maps and disabled inference must not even inspect audio.
+        if !auto_bpm || chart.rhythm_bpm_authored {
+            return Self::from_chart_bytes(chart, selection, cover);
+        }
+        let cover = image::load_from_memory(cover)
+            .context("failed to decode rhythm analysis cover")?
+            .into_rgba8();
+        let original = chart.rhythm_bpm_list.clone().unwrap_or_else(|| chart.bpm_list.borrow().clone());
+        let frames = music.frames();
+        // Preserve shared stereo attacks while avoiding complete cancellation
+        // when the recording's channels have opposite polarity.
+        let finite = |value: f32| if value.is_finite() { value } else { 0. };
+        let covariance = frames.iter().map(|frame| finite(frame.0) as f64 * finite(frame.1) as f64).sum::<f64>();
+        let right_sign = if covariance < 0. { -1. } else { 1. };
+        let estimate = super::rhythm_tempo::infer_if_missing(
+            true, false, frames.len(), music.sample_rate(),
+            |index| (finite(frames[index].0) + right_sign * finite(frames[index].1)) * 0.5,
+            original.now_bpm(0.),
+        );
+        let tempo = estimate.map_or(original, |estimate| {
+            tracing::info!(scale = estimate.scale, nodes = estimate.points.len(), "inferred rhythm BPM from audio");
+            let offset = if audio_offset.is_finite() { audio_offset } else { 0. };
+            let mut elements = Vec::with_capacity(estimate.points.len());
+            let mut beat = -estimate.first_beat_time * estimate.points[0].bpm / 60.;
+            let mut previous_time = 0.;
+            let mut previous_bpm = estimate.points[0].bpm;
+            for point in estimate.points {
+                beat += (point.time - previous_time) * previous_bpm / 60.;
+                elements.push((beat, point.time - offset, point.bpm));
+                previous_time = point.time;
+                previous_bpm = point.bpm;
+            }
+            BpmList { elements, cursor: 0 }
+        });
+        Ok(Self::from_chart_with_tempo(chart, selection, Some(&cover), tempo))
+    }
+
     pub fn from_chart(chart: &Chart, selection: RhythmNoteSelection, cover: Option<&RgbaImage>) -> Self {
         let tempo = chart.rhythm_bpm_list.clone().unwrap_or_else(|| chart.bpm_list.borrow().clone());
+        Self::from_chart_with_tempo(chart, selection, cover, tempo)
+    }
+
+    fn from_chart_with_tempo(chart: &Chart, selection: RhythmNoteSelection, cover: Option<&RgbaImage>, tempo: BpmList) -> Self {
         let events = chart
             .lines
             .iter()
@@ -472,6 +523,10 @@ impl RhythmStrip {
     /// No music offset, playback speed, or preroll is applied here: the caller
     /// has already resolved those in the scene's judgement clock.
     pub fn draw(&self, chart_time: f32, ui: &mut Ui) {
+        self.draw_sampled(chart_time, None, ui);
+    }
+
+    pub(super) fn draw_sampled(&self, chart_time: f32, previous_time: Option<f32>, ui: &mut Ui) {
         let time = if chart_time.is_finite() { chart_time } else { 0. };
         let top = ui.top;
         let h = 2. * top;
@@ -479,7 +534,7 @@ impl RhythmStrip {
         let judge = -1. + 2.4 * top;
         let pitch = self.time_pitch(top);
         let now = self.beat_at(time);
-        let pulse = metronome_pulse(now);
+        let pulse = metronome_pulse_sampled(now, previous_time.map(|time| self.beat_at(time)), previous_time.map_or(0., |previous| time - previous));
         let bg = mix(self.palette[0], Color::new(0.035, 0.043, 0.06, 1.), 0.88);
         ui.fill_rect(ui.screen_rect(), (mix(bg, self.palette[1], 0.10), (-1., -top), bg, (1., top)));
         ui.fill_rect(Rect::new(-1., -top, 2., h * 0.014), alpha(WHITE, 0.19));
@@ -612,6 +667,19 @@ fn metronome_pulse(beat: f32) -> f32 {
     let tolerance = 2. * f32::EPSILON * beat.abs().max(1.);
     let phase = if (beat - beat.round()).abs() <= tolerance { 0. } else { beat.rem_euclid(1.) };
     (-phase * 20.).exp()
+}
+
+pub(super) fn metronome_pulse_sampled(beat: f32, previous_beat: Option<f32>, elapsed: f32) -> f32 {
+    if elapsed.is_finite() && elapsed > 0. && elapsed <= 0.1 && beat.is_finite() {
+        if let Some(previous) = previous_beat.filter(|previous| previous.is_finite()) {
+            // Every real beat in the continuous frame interval gets its full
+            // luminous peak, even when no frame lands exactly on that beat.
+            if beat.floor() > previous.floor() {
+                return 1.;
+            }
+        }
+    }
+    metronome_pulse(beat)
 }
 
 const NOTE_HEIGHT_RATIO: f32 = 0.70;
@@ -938,6 +1006,119 @@ mod tests {
         RhythmStrip::from_events(tempo, events, cover_palette(None))
     }
 
+    fn auto_bpm_fixture(authored: bool) -> (Chart, Vec<u8>, sasa::AudioClip) {
+        use serde_json::json;
+        let mut source = json!({"offset":0.,"judgeLineList":[{
+            "bpm":120.,"judgeLineDisappearEvents":[],"judgeLineRotateEvents":[],
+            "judgeLineMoveEvents":[],"speedEvents":[{"startTime":0.,"endTime":10000.,"value":1.}],
+            "notesAbove":[
+                {"type":1,"time":1152.,"positionX":0.,"holdTime":0.,"speed":1.,"floorPosition":0.},
+                {"type":3,"time":1280.,"positionX":0.,"holdTime":128.,"speed":1.,"floorPosition":0.}
+            ],"notesBelow":[]
+        }]});
+        if authored {
+            source["BPMList"] = json!([
+                {"startTime":[0,0,1],"bpm":120.},
+                {"startTime":[4,0,1],"bpm":180.},
+                {"startTime":[10,0,1],"bpm":90.}
+            ]);
+        }
+        let chart = crate::parse::parse_phigros(&source.to_string(), super::super::ChartExtra::default()).unwrap();
+        let mut cover = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, image::Rgba([40, 80, 120, 255])))
+            .write_to(&mut cover, image::ImageOutputFormat::Png).unwrap();
+        (chart, cover.into_inner(), auto_bpm_audio(&[60., 100.], &[16., 16.]))
+    }
+
+    fn auto_bpm_audio(bpms: &[f64], lengths: &[f64]) -> sasa::AudioClip {
+        let mut frames = vec![sasa::Frame(0., 0.); ((lengths.iter().sum::<f64>() + 0.125) * 8000.) as usize];
+        let mut segment_start = 0.125;
+        for (&bpm, &length) in bpms.iter().zip(lengths) {
+            let mut beat = segment_start;
+            let end = segment_start + length;
+            while beat < end - 1e-6 {
+                let start = (beat * 8000.).round() as usize;
+                for i in 0..400.min(frames.len() - start) {
+                    let time = i as f64 / 8000.;
+                    let sample = ((-time / 0.012).exp() * (std::f64::consts::TAU * 1800. * time).sin()) as f32;
+                    // Complete antiphase cancellation under a naïve mono sum.
+                    frames[start + i] = sasa::Frame(sample, -sample);
+                }
+                beat += 60. / bpm;
+            }
+            segment_start = end;
+        }
+        sasa::AudioClip::from_raw(frames, 8000)
+    }
+
+    #[test]
+    fn rhythm_auto_bpm_defaults_and_authored_or_disabled_maps_remain_exact() {
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert!(legacy.rhythm_auto_bpm);
+        let disabled: Config = serde_json::from_str(r#"{"rhythmAutoBpm":false}"#).unwrap();
+        assert!(!disabled.rhythm_auto_bpm);
+        let restored: Config = serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
+        assert!(!restored.rhythm_auto_bpm);
+        for authored in [false, true] {
+            let (chart, cover, music) = auto_bpm_fixture(authored);
+            assert_eq!(chart.rhythm_bpm_authored, authored);
+            let baseline = RhythmStrip::from_chart_bytes(&chart, RhythmNoteSelection::default(), &cover).unwrap();
+            let inferred = RhythmStrip::from_chart_bytes_with_audio(
+                &chart, RhythmNoteSelection::default(), &cover, &music, authored, 9.75,
+            ).unwrap();
+            assert_eq!(inferred.tempo.points(), baseline.tempo.points());
+            let notes = |strip: &RhythmStrip| strip.notes.iter().map(|note|
+                (note.time, note.end_time, note.beat, note.end_beat, note.value)).collect::<Vec<_>>();
+            assert_eq!(notes(&inferred), notes(&baseline));
+        }
+    }
+
+    #[test]
+    fn rhythm_auto_bpm_antiphase_audio_fixed_scale_offsets_and_notes_share_seconds() {
+        let (chart, cover, music) = auto_bpm_fixture(false);
+        let build = |offset| RhythmStrip::from_chart_bytes_with_audio(
+            &chart, RhythmNoteSelection::default(), &cover, &music, true, offset,
+        ).unwrap();
+        let raw_axis = build(0.);
+        let chart_axis = build(0.375);
+        assert_eq!(raw_axis.tempo.points().len(), 2);
+        assert_eq!(raw_axis.bpm_at(0.), 120.);
+        assert_eq!(raw_axis.bpm_at(18.), 200.);
+        assert!((chart_axis.beat_at(0.128 - 0.375)).abs() < 0.02);
+        for (raw, shifted) in raw_axis.tempo.points().iter().zip(chart_axis.tempo.points()) {
+            assert_eq!(raw.0, shifted.0);
+            assert_eq!(raw.2, shifted.2);
+            assert!((raw.1 - shifted.1 - 0.375).abs() < 1e-5);
+        }
+        let baseline = RhythmStrip::from_chart(&chart, RhythmNoteSelection::default(), None);
+        for (original, inferred) in baseline.notes.iter().zip(&chart_axis.notes) {
+            assert_eq!(original.time, inferred.time);
+            assert_eq!(original.end_time, inferred.end_time);
+            assert_eq!(inferred.beat, chart_axis.beat_at(inferred.time));
+            assert_eq!(inferred.end_beat, chart_axis.beat_at(inferred.end_time));
+            assert_ne!(original.beat, inferred.beat);
+        }
+    }
+
+    #[test]
+    fn rhythm_auto_bpm_short_middle_run_integrates_a_strict_continuous_beat_axis() {
+        let (chart, cover, _) = auto_bpm_fixture(false);
+        let music = auto_bpm_audio(&[120., 180., 90.], &[16., 8., 16.]);
+        let inferred = RhythmStrip::from_chart_bytes_with_audio(
+            &chart, RhythmNoteSelection::default(), &cover, &music, true, 0.375,
+        ).unwrap();
+        assert_eq!(inferred.tempo.points().iter().map(|point| point.2.round() as i32).collect::<Vec<_>>(), vec![120, 180, 90]);
+        for nodes in inferred.tempo.points().windows(2) {
+            let (beat, time, bpm) = nodes[0];
+            let (next_beat, next_time, _) = nodes[1];
+            assert!(next_time > time && next_beat > beat);
+            assert!((next_beat - beat - (next_time - time) * bpm / 60.).abs() < 1e-4);
+            assert!((inferred.beat_at(next_time) - next_beat).abs() < 1e-5);
+            let around = inferred.beat_at(next_time + 0.0001) - inferred.beat_at(next_time - 0.0001);
+            assert!(around > 0. && around < 0.002, "node {next_time}: jump {around}");
+        }
+    }
+
     #[test]
     fn rhythm_adjust_layout_preserves_game_with_one_tenth_extension() {
         let layout = RhythmLayout::new(1920, 1080, true).unwrap();
@@ -1250,6 +1431,42 @@ mod tests {
         let slow_period = tempo.time_beats(12.) - tempo.time_beats(11.);
         let fast_period = tempo.time_beats(6.) - tempo.time_beats(5.);
         assert!((slow_period / fast_period - 2.).abs() < 0.00001);
+    }
+
+    #[test]
+    fn rhythm_sampled_metronome_every_137_and_variable_tempo_beat_reaches_one() {
+        for tempo in [BpmList::new(vec![(0., 137.)]), BpmList::new(vec![(0., 120.), (4., 180.), (10., 90.)])] {
+            for fps in [30., 60.] {
+                let mut previous_time = -0.125;
+                let mut previous_beat = tempo.beat(previous_time);
+                let mut crossings = 0;
+                for frame in 1..=(16. * fps) as usize {
+                    let time = frame as f32 / fps - 0.125;
+                    let beat = tempo.beat(time);
+                    let pulse = metronome_pulse_sampled(beat, Some(previous_beat), time - previous_time);
+                    if beat.floor() > previous_beat.floor() {
+                        assert_eq!(pulse, 1., "{fps}fps at beat {beat}");
+                        crossings += 1;
+                    } else {
+                        assert_eq!(pulse, metronome_pulse(beat));
+                    }
+                    previous_time = time;
+                    previous_beat = beat;
+                }
+                assert!(crossings > 20);
+            }
+        }
+    }
+
+    #[test]
+    fn rhythm_sampled_metronome_snapshots_seeks_and_repeat_use_static_phase() {
+        for elapsed in [0., -0.02, 0.101, 1., f32::NAN, f32::INFINITY] {
+            assert_eq!(metronome_pulse_sampled(5.125, Some(4.99), elapsed), metronome_pulse(5.125));
+        }
+        assert_eq!(metronome_pulse_sampled(5.125, None, 0.02), metronome_pulse(5.125));
+        assert_eq!(metronome_pulse_sampled(5.125, Some(f32::NAN), 0.02), metronome_pulse(5.125));
+        assert_eq!(metronome_pulse_sampled(4.99, Some(5.125), 0.02), metronome_pulse(4.99));
+        assert_eq!(metronome_pulse_sampled(5.125, Some(4.99), 0.1), 1.);
     }
 
     #[test]
