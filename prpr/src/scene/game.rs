@@ -13,7 +13,7 @@ use crate::judge::{JudgeStatus, Judgement};
 use crate::{
     bin::BinaryReader,
     config::{Config, Mods},
-    core::{BadNote, Chart, ChartExtra, Effect, Point, Resource, UIElement, Vector},
+    core::{BadNote, Chart, ChartExtra, Effect, Point, Resource, RhythmNoteSelection, RhythmStrip, UIElement, Vector},
     ext::{parse_time, screen_aspect, semi_white, RectExt, SafeTexture},
     fs::FileSystem,
     info::{ChartFormat, ChartInfo},
@@ -21,7 +21,7 @@ use crate::{
     parse::{parse_extra, parse_pec, parse_phigros, parse_rpe},
     task::Task,
     time::TimeManager,
-    ui::{RectButton, Ui},
+    ui::{FontArc, RectButton, TextPainter, Ui},
 };
 use anyhow::{bail, Context, Result};
 use concat_string::concat_string;
@@ -348,6 +348,8 @@ pub struct GameScene {
     exercise_btns: (RectButton, RectButton),
 
     pub music: Music,
+    rhythm_strip: Option<RhythmStrip>,
+    rhythm_painter: Option<TextPainter>,
 
     state: State,
     pub last_update_time: f64,
@@ -649,6 +651,14 @@ impl GameScene {
         }
 
         let info_offset = info.offset;
+        let rhythm_enabled = config.interactive && config.rhythm_analysis;
+        let rhythm_cover = if rhythm_enabled {
+            fs.load_file(&info.illustration).await.ok()
+                .and_then(|bytes| image::load_from_memory(&bytes).ok())
+                .map(|image| image.into_rgba8())
+        } else {
+            None
+        };
         let mut res = Resource::new(
             config.clone(),
             info,
@@ -667,6 +677,23 @@ impl GameScene {
         let judge = Judge::new(&chart);
 
         let music = Self::new_music(&mut res)?;
+        let rhythm_strip = if rhythm_enabled {
+            Some(RhythmStrip::from_chart_with_audio(
+                &chart,
+                RhythmNoteSelection::from(&res.config),
+                rhythm_cover.as_ref(),
+                &res.music,
+                res.config.rhythm_auto_bpm,
+                chart.offset + res.config.offset + info_offset,
+            ).with_speed(res.config.rhythm_speed).with_colors(res.config.rhythm_colors.as_ref()))
+        } else {
+            None
+        };
+        let rhythm_painter = rhythm_strip.as_ref().map(|_| {
+            let font = FontArc::try_from_slice(include_bytes!("../../assets/fonts/Saira-SemiBold.ttf"))
+                .expect("embedded Saira font is valid");
+            TextPainter::new(font)
+        });
 
         let chart_ratio = res.config.chart_ratio;
         let judgement_counters = vec![
@@ -696,6 +723,8 @@ impl GameScene {
             exercise_btns: (RectButton::new(), RectButton::new()),
 
             music,
+            rhythm_strip,
+            rhythm_painter,
 
             state: State::Starting,
             last_update_time: 0.,
@@ -2095,6 +2124,23 @@ impl Scene for GameScene {
             }
         } else {
             self.gl.flush();
+        }
+
+        if let (Some(strip), Some(painter)) = (&self.rhythm_strip, &mut self.rhythm_painter) {
+            let (x, y, width, height) = ui.viewport;
+            let strip_height = (((width.max(0) as u64 + 10) / 20) * 2)
+                .min((height.max(1) / 3) as u64)
+                .max(1) as i32;
+            let viewport = (x, y, width, strip_height);
+            self.gl.flush();
+            push_camera_state();
+            let mut rhythm_ui = Ui::new(painter, Some(viewport));
+            let mut camera = rhythm_ui.camera();
+            camera.render_target = target;
+            set_camera(&camera);
+            strip.draw(self.res.time, &mut rhythm_ui);
+            self.gl.flush();
+            pop_camera_state();
         }
 
         Ok(())

@@ -91,8 +91,8 @@ pub enum RhythmShape {
     Star,
 }
 
-/// Durations are inferred from successive distinct selected onsets; holds use
-/// their authored duration. All lines share one analysis note per onset.
+/// Durations come from successive distinct selected onsets and stop at one
+/// quarter-note beat. Holds contribute only their onset, like a tap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RhythmValue {
     Whole,
@@ -151,6 +151,9 @@ impl RhythmValue {
         if !beats.is_finite() || beats <= 0. {
             return Self::Quarter;
         }
+        // A long interval contains one quarter-note onset followed by empty
+        // beat guides. Do not invent notes or rest symbols in the silent gap.
+        let beats = beats.min(1.);
         let tolerance = (beats * 0.0002).max(precision).max(0.000002);
         let candidates = [
             (4., Self::Whole),
@@ -237,22 +240,18 @@ impl RhythmValue {
 
     pub fn label(self) -> Cow<'static, str> {
         Cow::Borrowed(match self {
-            Self::Whole => "1",
-            Self::DottedHalf => "2.",
-            Self::Half => "2",
-            Self::DottedQuarter => "4.",
+            Self::Whole | Self::DottedHalf | Self::Half | Self::DottedQuarter | Self::HalfTriplet => "4",
             Self::Quarter => "4",
-            Self::DottedEighth => "8.",
+            Self::DottedEighth => "16/3",
             Self::Eighth => "8",
-            Self::DottedSixteenth => "16.",
+            Self::DottedSixteenth => "32/3",
             Self::Sixteenth => "16",
             Self::ThirtySecond => "32",
             Self::SixtyFourth => "64",
-            Self::HalfTriplet => "2T",
-            Self::QuarterTriplet => "4T",
-            Self::EighthTriplet => "8T",
-            Self::SixteenthTriplet => "16T",
-            Self::ThirtySecondTriplet => "32T",
+            Self::QuarterTriplet => "3",
+            Self::EighthTriplet => "6",
+            Self::SixteenthTriplet => "12",
+            Self::ThirtySecondTriplet => "24",
             Self::Tuplet(count) => return Cow::Owned(count.to_string()),
             Self::Ratio(numerator, denominator) => return Cow::Owned(format!("{numerator}/{denominator}")),
         })
@@ -280,9 +279,6 @@ pub struct RhythmNote {
 pub struct RhythmStrip {
     tempo: BpmList,
     notes: Vec<RhythmNote>,
-    holds: Vec<usize>,
-    /// Max endpoint of preceding holds, for bounded sustained-note searches.
-    hold_max_end: Vec<f32>,
     palette: [Color; 3],
     auto_palette: [Color; 3],
     speed: f32,
@@ -306,13 +302,25 @@ impl RhythmStrip {
         auto_bpm: bool,
         audio_offset: f32,
     ) -> Result<Self> {
-        // Authored maps and disabled inference must not even inspect audio.
-        if !auto_bpm || chart.rhythm_bpm_authored {
-            return Self::from_chart_bytes(chart, selection, cover);
-        }
         let cover = image::load_from_memory(cover)
             .context("failed to decode rhythm analysis cover")?
             .into_rgba8();
+        Ok(Self::from_chart_with_audio(chart, selection, Some(&cover), music, auto_bpm, audio_offset))
+    }
+
+    pub fn from_chart_with_audio(
+        chart: &Chart,
+        selection: RhythmNoteSelection,
+        cover: Option<&RgbaImage>,
+        music: &sasa::AudioClip,
+        auto_bpm: bool,
+        audio_offset: f32,
+    ) -> Self {
+        // Authored maps and disabled inference must not even inspect audio.
+        if !auto_bpm || chart.rhythm_bpm_authored {
+            let tempo = chart.rhythm_bpm_list.clone().unwrap_or_else(|| chart.bpm_list.borrow().clone());
+            return Self::from_chart_with_tempo(chart, selection, cover, tempo);
+        }
         let original = chart.rhythm_bpm_list.clone().unwrap_or_else(|| chart.bpm_list.borrow().clone());
         let frames = music.frames();
         // Preserve shared stereo attacks while avoiding complete cancellation
@@ -340,7 +348,7 @@ impl RhythmStrip {
             }
             BpmList { elements, cursor: 0 }
         });
-        Ok(Self::from_chart_with_tempo(chart, selection, Some(&cover), tempo))
+        Self::from_chart_with_tempo(chart, selection, cover, tempo)
     }
 
     pub fn from_chart(chart: &Chart, selection: RhythmNoteSelection, cover: Option<&RgbaImage>) -> Self {
@@ -358,7 +366,7 @@ impl RhythmStrip {
                 NoteKind::Click => (note.time, note.time, RhythmKind::Tap),
                 NoteKind::Drag => (note.time, note.time, RhythmKind::Drag),
                 NoteKind::Flick => (note.time, note.time, RhythmKind::Flick),
-                NoteKind::Hold { end_time, .. } => (note.time, end_time, RhythmKind::Hold),
+                NoteKind::Hold { .. } => (note.time, note.time, RhythmKind::Tap),
             })
             .collect();
         Self::from_events(tempo, events, cover_palette(cover))
@@ -379,53 +387,26 @@ impl RhythmStrip {
                 end += 1;
             }
             let next_beat = events.get(end).map(|event| tempo.beat(event.0));
-            let mut longest_hold: Option<f32> = None;
             let mut kind = RhythmKind::Tap;
-            for &(event_time, end_time, event_kind) in &events[begin..end] {
+            for &(_, _, event_kind) in &events[begin..end] {
                 match event_kind {
-                    RhythmKind::Hold if end_time.is_finite() && end_time > event_time => {
-                        longest_hold = Some(longest_hold.map_or(end_time, |previous| previous.max(end_time)));
-                    }
                     RhythmKind::Flick => kind = RhythmKind::Flick,
                     RhythmKind::Drag if kind != RhythmKind::Flick => kind = RhythmKind::Drag,
                     _ => {}
                 }
             }
             let beat = tempo.beat(time);
-            let end_time = longest_hold.unwrap_or(time);
-            let end_beat = tempo.beat(end_time).max(beat);
-            if longest_hold.is_some() {
-                kind = RhythmKind::Hold;
-            }
-            let value = if end_beat > beat {
-                RhythmValue::classify_span(beat, end_beat)
-            } else {
-                // No following global onset can establish the terminal value.
-                next_beat.map_or(RhythmValue::Quarter, |end| RhythmValue::classify_span(beat, end))
-            };
+            let end_time = time;
+            let end_beat = beat;
+            // All source kinds, including holds, use the next global onset.
+            // No following onset can establish the terminal value.
+            let value = next_beat.map_or(RhythmValue::Quarter, |end| RhythmValue::classify_span(beat, end));
             notes.push(RhythmNote { time, end_time, beat, end_beat, kind, value });
             begin = end;
         }
-        let holds: Vec<_> = notes
-            .iter()
-            .enumerate()
-            .filter(|(_, note)| note.end_beat > note.beat)
-            .map(|(index, _)| index)
-            .collect();
-        let mut max = f32::NEG_INFINITY;
-        let hold_max_end = holds
-            .iter()
-            .map(|&index| {
-                let note = &notes[index];
-                max = max.max(note.end_beat);
-                max
-            })
-            .collect();
         Self {
             tempo,
             notes,
-            holds,
-            hold_max_end,
             palette,
             auto_palette: palette,
             speed: 1.,
@@ -483,34 +464,7 @@ impl RhythmStrip {
     fn visible_notes(&self, first: f32, last: f32) -> impl Iterator<Item = &RhythmNote> {
         let begin = self.notes.partition_point(|note| note.beat < first);
         let end = self.notes.partition_point(|note| note.beat <= last);
-        let mut heads = (begin.min(end)..end).rev().peekable();
-        let hold_begin = self.hold_max_end.partition_point(|&end| end < first);
-        let hold_end = self.holds.partition_point(|&index| self.notes[index].beat <= last);
-        let mut holds = self.holds[hold_begin.min(hold_end)..hold_end].iter().rev().copied().peekable();
-        // Merge the two descending index streams without allocating or
-        // scanning expired tap notes behind a still-active long hold.
-        std::iter::from_fn(move || {
-            let index = match (heads.peek().copied(), holds.peek().copied()) {
-                (Some(head), Some(hold)) if head >= hold => {
-                    heads.next();
-                    if head == hold {
-                        holds.next();
-                    }
-                    head
-                }
-                (Some(_), Some(hold)) | (None, Some(hold)) => {
-                    holds.next();
-                    hold
-                }
-                (Some(head), None) => {
-                    heads.next();
-                    head
-                }
-                (None, None) => return None,
-            };
-            Some(&self.notes[index])
-        })
-        .filter(move |note| note.beat >= first || note.end_beat >= first)
+        self.notes[begin.min(end)..end].iter().rev()
     }
 
     /// x is normalized to the strip's -1..1 camera. At `note.time`, x is
@@ -572,10 +526,10 @@ impl RhythmStrip {
         let bands = RhythmBands::new(left, h);
         ui.fill_rect(bands.labels, alpha(Color::new(0.02, 0.025, 0.035, 1.), 0.58));
         ui.fill_rect(Rect::new(left, bands.labels.y, 1. - left, h * 0.003), alpha(WHITE, 0.08));
-        // Note heads, their glows, and hold tails are physically clipped above
-        // the label band, including when future notes overlap each other.
+        // Onset heads and their glows are physically clipped above the label
+        // band, including when future notes overlap each other.
         ui.scissor(Some(bands.notes));
-        // Guide beats sit behind both sustain bands and note heads.
+        // Guide beats sit behind the onset heads.
         let first_beat = self.beat_at(time + (left - judge) / pitch).floor() as i64;
         let last_beat = self.beat_at(time + (1. - judge) / pitch).ceil() as i64;
         let dash_width = (h * 0.012).max(2. / ui.viewport.2.max(1) as f32);
@@ -603,20 +557,6 @@ impl RhythmStrip {
             let (shape, color) = note.value.style();
             let (y, radius) = note_geometry(shape, bands.notes);
             let c = self.palette[color];
-            // Paint each whole note together (tail, then head), so an earlier
-            // hold also stays above every later note it overlaps.
-            if note.end_beat > note.beat {
-                let start = x.max(left - radius);
-                let tail = self.time_position_x(note.end_time, time, top).min(1. + radius);
-                if tail > start {
-                    ui.fill_rect(
-                        Rect::new(start, y - radius * 0.32, tail - start, radius * 0.64),
-                        (alpha(c, 0.32), (start, y - radius * 0.32), alpha(c, 0.12), (start, y + radius * 0.32)),
-                    );
-                    ui.fill_rect(Rect::new(start, y - radius * 0.05, tail - start, radius * 0.10), alpha(c, 0.62));
-                    ui.fill_circle(tail, y, radius * 0.27, alpha(c, 0.7));
-                }
-            }
             if x + radius < left || x - radius > 1. {
                 continue;
             }
@@ -636,8 +576,7 @@ impl RhythmStrip {
                     b.triangle(0, 1, 2);
                     b.commit();
                 }
-                RhythmKind::Hold => ui.fill_rect(Rect::new(x - radius * 0.24, y - radius * 0.06, radius * 0.48, radius * 0.12), alpha(WHITE, 0.72)),
-                RhythmKind::Tap => {}
+                RhythmKind::Hold | RhythmKind::Tap => {}
             }
         }
         ui.scissor(Some(bands.labels));
@@ -793,6 +732,18 @@ pub fn extract_cover_palette(cover: &[u8]) -> Result<[String; 3]> {
         .context("failed to decode chart illustration for rhythm colors")?
         .to_rgba8();
     Ok(cover_palette(Some(&cover)).map(color_hex))
+}
+
+/// Return the exact RGB pixel at an artwork coordinate for the UI eyedropper.
+/// Coordinates use the decoded image's top-left origin, matching the browser
+/// preview's `object-fit: contain` mapping.
+pub fn sample_cover_color(cover: &[u8], x: u32, y: u32) -> Result<String> {
+    let cover = image::load_from_memory(cover)
+        .context("failed to decode chart illustration for rhythm color sampling")?
+        .to_rgba8();
+    ensure!(x < cover.width() && y < cover.height(), "artwork sample is outside the image");
+    let pixel = cover.get_pixel(x, y);
+    Ok(format!("#{:02X}{:02X}{:02X}", pixel[0], pixel[1], pixel[2]))
 }
 
 fn color_hex(color: Color) -> String {
@@ -1152,7 +1103,7 @@ mod tests {
     }
 
     #[test]
-    fn rhythm_132_global_simultaneous_notes_merge_one_head_and_keep_longest_hold_span() {
+    fn rhythm_numeric_simultaneous_hold_starts_merge_with_taps_and_keep_kind_priority() {
         let tempo = BpmList::new(vec![(0., 120.), (4., 240.)]);
         let strip = strip(
             vec![
@@ -1165,11 +1116,12 @@ mod tests {
             tempo,
         );
         assert_eq!(strip.notes().len(), 2);
-        let hold = &strip.notes()[0];
-        assert_eq!(hold.time, 1.75);
-        assert_eq!(hold.kind, RhythmKind::Hold);
-        assert_eq!(hold.value, RhythmValue::DottedQuarter);
-        assert!((hold.end_beat - hold.beat - 1.5).abs() < 0.00001);
+        let onset = &strip.notes()[0];
+        assert_eq!(onset.time, 1.75);
+        assert_eq!(onset.kind, RhythmKind::Flick);
+        assert_eq!(onset.value, RhythmValue::Eighth);
+        assert_eq!(onset.end_time, onset.time);
+        assert_eq!(onset.end_beat, onset.beat);
         assert_eq!(strip.notes()[1].value, RhythmValue::Quarter);
     }
 
@@ -1240,7 +1192,7 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                (2., RhythmKind::Hold),
+                (2., RhythmKind::Tap),
                 (1., RhythmKind::Flick),
                 (0.5, RhythmKind::Drag)
             ]
@@ -1251,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn rhythm_adjust_active_hold_and_future_heads_share_earliest_on_top_order() {
+    fn rhythm_numeric_hold_starts_leave_no_visible_tail_after_the_head() {
         let strip = strip(
             vec![
                 (0., 5., RhythmKind::Hold),
@@ -1262,12 +1214,10 @@ mod tests {
             ],
             BpmList::new(vec![(0., 120.)]),
         );
-        // The first hold's head has left the visible region, but its tail must
-        // paint last above later heads; expired short holds stay absent.
+        // Only starts inside the visible range count. Long authored tails
+        // must not keep an expired onset visible or fill otherwise empty beats.
         let order: Vec<_> = strip.visible_notes(3., 8.).map(|note| note.time).collect();
-        assert_eq!(order, vec![3., 2., 0.]);
-        // A visible hold is merged once even though its head and tail both
-        // qualify for the visible region.
+        assert_eq!(order, vec![3., 2.]);
         let order: Vec<_> = strip.visible_notes(0., 8.).map(|note| note.time).collect();
         assert_eq!(order, vec![3., 2., 1., 0.5, 0.]);
     }
@@ -1332,6 +1282,42 @@ mod tests {
     }
 
     #[test]
+    fn rhythm_numeric_labels_replace_triplet_and_dotted_notation() {
+        for (beats, label) in [
+            (1., "4"), (0.5, "8"), (0.25, "16"),
+            (2. / 3., "3"), (1. / 3., "6"), (1. / 6., "12"), (1. / 12., "24"),
+            (0.75, "16/3"), (0.375, "32/3"),
+        ] {
+            assert_eq!(RhythmValue::classify(beats).label(), label);
+        }
+        for value in RhythmValue::ALL {
+            assert!(value.label().chars().all(|character| character.is_ascii_digit() || character == '/'));
+        }
+        for count in [5, 7, 13] {
+            assert_eq!(RhythmValue::classify(1. / count as f32).label(), count.to_string());
+        }
+    }
+
+    #[test]
+    fn rhythm_numeric_long_gaps_have_one_quarter_onset_and_empty_following_beats() {
+        for beats in [1., 1.5, 2., 3., 4., 12.] {
+            assert_eq!(RhythmValue::classify(beats), RhythmValue::Quarter);
+            assert_eq!(RhythmValue::classify(beats).label(), "4");
+        }
+        let analysis = strip(
+            vec![(0., 10., RhythmKind::Hold), (6., 6., RhythmKind::Tap)],
+            BpmList::new(vec![(0., 120.), (4., 180.)]),
+        );
+        assert_eq!(analysis.notes().len(), 2);
+        assert!(analysis.notes().iter().all(|note| note.value == RhythmValue::Quarter));
+        assert!(analysis.notes().iter().all(|note| note.kind == RhythmKind::Tap && note.end_time == note.time));
+        assert!(analysis.visible_notes(1., 10.).next().is_none());
+        // Beat guides still query the complete authored musical clock.
+        assert_eq!(analysis.bpm_at(3.), 180.);
+        assert_eq!(analysis.beat_at(3.), 7.);
+    }
+
+    #[test]
     fn rhythm_132_tuplet_counts_follow_actual_fraction_and_binary_subdivision() {
         for count in [5, 7, 9, 11, 13, 17, 25, 53] {
             for numerator in [1., 2., 4.] {
@@ -1371,14 +1357,14 @@ mod tests {
     }
 
     #[test]
-    fn rhythm_132_time_axis_heads_and_hold_tails_cross_tempo_nodes_continuously() {
+    fn rhythm_numeric_onset_only_heads_cross_tempo_nodes_continuously() {
         let strip = strip(
             vec![(1.5, 5.5, RhythmKind::Hold), (3., 3., RhythmKind::Tap), (4.5, 4.5, RhythmKind::Tap)],
             BpmList::new(vec![(0., 120.), (4., 180.), (10., 90.)]),
         );
         let top = 0.1;
         let epsilon = 0.001;
-        assert_eq!(strip.notes()[0].end_time, 5.5);
+        assert_eq!(strip.notes()[0].end_time, 1.5);
         for boundary in [2., 4.] {
             for note in strip.notes() {
                 let before = strip.position_x(note, boundary - epsilon, top);
@@ -1386,14 +1372,13 @@ mod tests {
                 let after = strip.position_x(note, boundary + epsilon, top);
                 assert!((before - at - epsilon * strip.time_pitch(top)).abs() < 0.000001);
                 assert!((at - after - epsilon * strip.time_pitch(top)).abs() < 0.000001);
-                let tail_before = strip.time_position_x(note.end_time, boundary - epsilon, top);
-                let tail_after = strip.time_position_x(note.end_time, boundary + epsilon, top);
-                assert!((tail_before - tail_after - 2. * epsilon * strip.time_pitch(top)).abs() < 0.000001);
+                assert_eq!(note.end_time, note.time);
+                assert_eq!(note.end_beat, note.beat);
                 let first_time = boundary - 0.2;
                 let last_time = boundary + 0.2;
                 let visible: Vec<_> = strip.visible_notes(strip.beat_at(first_time), strip.beat_at(last_time))
                     .map(|note| note.time).collect();
-                assert!(visible.contains(&1.5)); // off-screen hold head, visible authored tail
+                assert!(!visible.contains(&1.5)); // authored tail never extends the onset
             }
         }
         for note in strip.notes() {
@@ -1470,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn rhythm_132_tuplet_onsets_and_hold_spans_survive_large_offsets() {
+    fn rhythm_numeric_tuplet_onsets_and_hold_starts_survive_large_offsets() {
         for offset in [0., 16., 128., 1000.] {
             for count in [5, 7, 13] {
                 let duration = 1. / count as f32;
@@ -1482,8 +1467,8 @@ mod tests {
                     ],
                     BpmList::new(vec![(0., 120.)]),
                 );
-                // A one-beat tuplet interval at 120 BPM takes half as long in
-                // seconds; the hold spans two of those subdivisions.
+                // Only the next global start determines the value, even when
+                // a coincident hold lasts longer than that onset interval.
                 assert_eq!(strip.notes()[0].value, RhythmValue::Tuplet(count), "hold {offset}/{count}");
                 assert_eq!(strip.notes().len(), 2);
                 assert_eq!(strip.notes()[0].value.label(), count.to_string());
@@ -1520,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn rhythm_132_global_chart_lines_share_onsets_values_and_longest_hold_independent_of_line_order() {
+    fn rhythm_numeric_chart_lines_share_onsets_and_ignore_hold_tails_independent_of_line_order() {
         use serde_json::json;
         let note = |kind, time, hold| json!({"type":kind,"time":time,"positionX":0.,
             "holdTime":hold,"speed":1.,"floorPosition":0.});
@@ -1541,7 +1526,7 @@ mod tests {
         assert_eq!(merged, analyse(json!([b, a])));
         assert_eq!(merged.len(), 4);
         assert_eq!(merged[0], (0.5, 1., 1., RhythmKind::Flick, RhythmValue::Quarter));
-        assert_eq!(merged[1], (1., 2., 5., RhythmKind::Hold, RhythmValue::DottedHalf));
+        assert_eq!(merged[1], (1., 2., 2., RhythmKind::Tap, RhythmValue::Quarter));
         assert_eq!(merged[2], (1.5, 3., 3., RhythmKind::Tap, RhythmValue::Eighth));
         assert_eq!(merged[3], (1.75, 3.5, 3.5, RhythmKind::Drag, RhythmValue::Quarter));
     }
@@ -1647,7 +1632,15 @@ mod tests {
         assert_eq!(selected.bpm_at(0.9), 120.);
         assert_eq!(selected.notes()[0].time, 0.5); // chart offset is applied only by GameScene
         assert_eq!(selected.notes()[0].beat, 1.);
-        assert_eq!(selected.notes()[1].kind, RhythmKind::Hold);
+        assert_eq!(selected.notes()[1].kind, RhythmKind::Tap);
+        let only_holds = RhythmStrip::from_chart(&chart, RhythmNoteSelection {
+            tap: false, drag: false, hold: true, flick: false,
+        }, None);
+        assert_eq!(only_holds.notes().len(), 1);
+        assert_eq!(only_holds.notes()[0].time, 1.);
+        assert_eq!(only_holds.notes()[0].kind, RhythmKind::Tap);
+        assert_eq!(only_holds.notes()[0].end_time, only_holds.notes()[0].time);
+        assert!(chart.lines[1].notes.iter().any(|note| matches!(note.kind, NoteKind::Hold { .. })));
         let all = RhythmNoteSelection {
             tap: true,
             drag: true,
@@ -1765,6 +1758,23 @@ mod tests {
         assert_eq!(colors, automatic.map(color_hex));
         assert_eq!(auto.with_colors(Some(&colors)).palette(), automatic);
         assert!(extract_cover_palette(b"not an image").is_err());
+    }
+
+    #[test]
+    fn rhythm_color_sampling_returns_exact_pixels_and_rejects_invalid_coordinates_or_data() {
+        use std::io::Cursor;
+        let image = RgbaImage::from_fn(96, 16, |x, _| {
+            image::Rgba(if x < 32 { [170, 34, 34, 255] } else if x < 64 { [34, 153, 68, 255] } else { [34, 51, 187, 255] })
+        });
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image).write_to(&mut encoded, image::ImageOutputFormat::Png).unwrap();
+        assert_eq!(sample_cover_color(encoded.get_ref(), 10, 8).unwrap(), "#AA2222");
+        assert_eq!(sample_cover_color(encoded.get_ref(), 40, 8).unwrap(), "#229944");
+        assert_eq!(sample_cover_color(encoded.get_ref(), 80, 8).unwrap(), "#2233BB");
+        let error = sample_cover_color(encoded.get_ref(), 96, 8).unwrap_err().to_string();
+        assert!(error.contains("outside the image"), "unexpected error: {error}");
+        let error = sample_cover_color(b"not an image", 0, 0).unwrap_err().to_string();
+        assert!(error.contains("decode chart illustration"), "unexpected error: {error}");
     }
 
     #[test]
