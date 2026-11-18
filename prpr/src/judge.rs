@@ -250,11 +250,16 @@ pub struct Judge {
 }
 
 thread_local! {
-    static SUBSCRIBER_ID: Lazy<usize> = Lazy::new(register_input_subscriber);
+    static SUBSCRIBER_ID: RefCell<Lazy<usize>> = RefCell::new(Lazy::new(register_input_subscriber));
     static TOUCHES: RefCell<(Vec<Touch>, i32, u32)> = RefCell::default();
 }
 
 impl Judge {
+    // Input queues belong to a macroquad context, but this thread-local survives it.
+    pub(crate) fn reset_input_subscriber() {
+        SUBSCRIBER_ID.with(|id| *id.borrow_mut() = Lazy::new(register_input_subscriber));
+    }
+
     pub fn new(chart: &Chart) -> Self {
         let notes = chart
             .lines
@@ -452,7 +457,7 @@ impl Judge {
 
     pub(crate) fn on_new_frame() {
         let mut handler = Handler(Vec::new(), 0, 0);
-        SUBSCRIBER_ID.with(|id| repeat_all_miniquad_input(&mut handler, **id));
+        SUBSCRIBER_ID.with(|id| repeat_all_miniquad_input(&mut handler, **id.borrow()));
         handler.finalize();
         TOUCHES.with(|it| {
             *it.borrow_mut() = (handler.0, handler.1, handler.2);

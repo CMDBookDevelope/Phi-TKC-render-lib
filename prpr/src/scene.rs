@@ -378,6 +378,7 @@ pub struct Main {
 
 impl Main {
     pub async fn new(mut scene: Box<dyn Scene>, mut tm: TimeManager, mut target_chooser: impl RenderTargetChooser + 'static) -> Result<Self> {
+        Judge::reset_input_subscriber();
         simulate_mouse_with_touch(false);
         scene.enter(&mut tm, target_chooser.choose())?;
         let last_update_time = tm.now();

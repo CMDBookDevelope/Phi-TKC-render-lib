@@ -5547,6 +5547,7 @@ dependencies = [
  "intl-memoizer",
  "js-sys",
  "libc",
+ "log",
  "lru",
  "lyon",
  "macroquad 0.3.25 (git+https://github.com/CMDBookDevelope/prpr-macroquad)",
