@@ -66,6 +66,18 @@ impl MSRenderTarget {
         self.out.swap(0, 1);
     }
 
+    /// Start a new scene frame on the texture the multisampled pass resolves
+    /// into. An odd number of post effects leaves the ping-pong output on the
+    /// other texture; carrying that index into the next frame samples stale
+    /// output instead of the freshly resolved scene.
+    pub fn begin_frame(&mut self) {
+        if let Some(input) = self.inp {
+            if self.out[0].texture != input.texture {
+                self.swap();
+            }
+        }
+    }
+
     pub fn input(&self) -> RenderTarget {
         self.inp.unwrap_or(self.out[0])
     }

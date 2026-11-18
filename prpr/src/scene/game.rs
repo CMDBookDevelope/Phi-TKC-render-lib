@@ -1900,6 +1900,10 @@ impl Scene for GameScene {
 
         let msaa = res.config.sample_count > 1;
 
+        if let Some(target) = res.chart_target.as_mut() {
+            target.begin_frame();
+        }
+
         let chart_onto = res
             .chart_target
             .as_ref()
