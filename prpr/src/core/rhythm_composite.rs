@@ -52,7 +52,17 @@ impl RhythmComposite {
     }
 
     pub fn new_hdr(width: u32, height: u32, strip: Option<RhythmStrip>, slots: usize) -> Result<Self> {
-        Self::with_format(width, height, strip, slots, false, true)
+        Self::new_hdr_with_alpha(width, height, strip, slots, false)
+    }
+
+    pub fn new_hdr_with_alpha(
+        width: u32,
+        height: u32,
+        strip: Option<RhythmStrip>,
+        slots: usize,
+        preserve_alpha: bool,
+    ) -> Result<Self> {
+        Self::with_format(width, height, strip, slots, preserve_alpha, true)
     }
 
     fn with_format(
