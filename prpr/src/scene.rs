@@ -15,7 +15,7 @@ use crate::{
     time::TimeManager,
     ui::{BillBoard, Dialog, Message, MessageHandle, MessageKind, TextPainter, Ui},
 };
-use anyhow::{Error, Result};
+use anyhow::{Context, Error, Result};
 use cfg_if::cfg_if;
 use macroquad::prelude::*;
 use std::{any::Any, cell::RefCell, sync::Mutex};
@@ -504,6 +504,11 @@ impl Main {
     }
 
     pub fn render(&mut self, painter: &mut TextPainter) -> Result<()> {
+        self.render_with_overlay_target(painter, None)
+    }
+
+    /// Draw top-level messages and dialogs into a separate SDR target for display compositing.
+    pub fn render_with_overlay_target(&mut self, painter: &mut TextPainter, overlay: Option<RenderTarget>) -> Result<()> {
         if self.paused {
             return Ok(());
         }
@@ -516,9 +521,14 @@ impl Main {
         ui.scope(|ui| self.scenes.last_mut().unwrap().render(&mut self.tm, ui, target))?;
         if self.top_level {
             push_camera_state();
-            set_camera(&ui.camera());
+            let mut overlay_camera = ui.camera();
+            overlay_camera.render_target = overlay;
+            set_camera(&overlay_camera);
             let mut gl = unsafe { get_internal_gl() };
             gl.flush();
+            if overlay.is_some() {
+                clear_background(BLANK);
+            }
             // gl.quad_gl.render_pass(None);
             // gl.quad_gl.viewport(None);
             BILLBOARD.with(|it| {
@@ -558,4 +568,119 @@ fn draw_background(tex: Texture2D) {
     draw_rectangle(-1., -top, 2., top * 2., Color::new(0., 0., 0., 0.3));
 }
 
+pub(crate) struct SceneBackground {
+    video: Option<crate::core::Video>,
+    mode: crate::config::BackgroundVideoPlayback,
+    interval: Option<(f64, f64)>,
+    start: Option<f64>,
+    preview_span: Option<f64>,
+    transparent: bool,
+    color: Option<Color>,
+}
+
+impl SceneBackground {
+    pub(crate) fn new(config: &crate::config::Config) -> Result<Self> {
+        let video = if config.background_mode == "video" {
+            let path = config.background_video.as_ref().context("background video path is required")?;
+            Some(crate::core::Video::open_background(path.into()).context("failed to open background video")?)
+        } else {
+            None
+        };
+        let color = match config.background_mode.as_str() {
+            "solid" => {
+                let [r, g, b, a] = config.background_color;
+                Some(Color::new(r, g, b, a))
+            }
+            "video" | "none" => Some(if config.transparent_background { BLANK } else { BLACK }),
+            _ => None,
+        };
+        Ok(Self {
+            video,
+            mode: config.background_video_playback,
+            interval: config.background_video_interval,
+            start: None,
+            preview_span: None,
+            transparent: config.transparent_background,
+            color,
+        })
+    }
+
+    pub(crate) fn set_preview_span(&mut self, span: f64) {
+        self.preview_span = Some(span);
+    }
+
+    pub(crate) fn draw(&mut self, image: Texture2D, aspect: f32, now: f64) -> Result<bool> {
+        use crate::config::BackgroundVideoPlayback::{Repeat, Stretch};
+        let Some(color) = self.color else {
+            clear_background(BLACK);
+            draw_background(image);
+            return Ok(true);
+        };
+        clear_background(color);
+        let Some(video) = self.video.as_mut() else {
+            return Ok(color.a != 0.);
+        };
+        let start = *self.start.get_or_insert(now);
+        let (start, span) = self.interval.unwrap_or((start, self.preview_span.unwrap_or(1.)));
+        let elapsed = (now - start).max(0.);
+        let source_time = if matches!(self.mode, Stretch) {
+            let duration = video.duration().context("The video duration is unavailable for stretch playback")?;
+            (elapsed / span.max(f64::EPSILON)).clamp(0., 1. - f64::EPSILON) * duration
+        } else {
+            elapsed
+        };
+        let visible = video.update_background(source_time, matches!(self.mode, Repeat))?;
+        video.render_background(aspect);
+        Ok(visible || !self.transparent)
+    }
+}
+
+pub(crate) type SharedSceneBackground = std::rc::Rc<std::cell::RefCell<SceneBackground>>;
+
 pub type LocalSceneTask = LocalTask<Result<NextScene>>;
+
+fn hdr_scene_input(
+    enabled: bool,
+    scratch: &mut Option<crate::core::MSRenderTarget>,
+    viewport: (i32, i32, i32, i32),
+    output: Option<RenderTarget>,
+) -> Option<RenderTarget> {
+    if !enabled || output.is_none() || viewport.2 <= 0 || viewport.3 <= 0 {
+        *scratch = None;
+        return output;
+    }
+    let size = (viewport.2 as u32, viewport.3 as u32);
+    if scratch.as_ref().map(crate::core::MSRenderTarget::dimensions) != Some(size) {
+        *scratch = Some(crate::core::MSRenderTarget::new_hdr(size, 1));
+    }
+    scratch.as_ref().map(crate::core::MSRenderTarget::input)
+}
+
+fn finish_hdr_scene(
+    scratch: &mut Option<crate::core::MSRenderTarget>,
+    viewport: (i32, i32, i32, i32),
+    output: Option<RenderTarget>,
+) {
+    let Some(frame) = scratch.as_mut() else {
+        return;
+    };
+    frame.map_hdr(&crate::config::HdrLayerSettings::default());
+    let aspect = viewport.2 as f32 / viewport.3 as f32;
+    set_camera(&Camera2D {
+        zoom: vec2(1., aspect),
+        viewport: Some(viewport),
+        render_target: output,
+        ..Default::default()
+    });
+    clear_background(BLANK);
+    draw_texture_ex(
+        frame.output().texture,
+        -1.,
+        -1. / aspect,
+        WHITE,
+        DrawTextureParams {
+            dest_size: Some(vec2(2., 2. / aspect)),
+            ..Default::default()
+        },
+    );
+}

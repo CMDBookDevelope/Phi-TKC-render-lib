@@ -1,15 +1,18 @@
 use bitflags::bitflags;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 unsafe impl Send for Config {}
 unsafe impl Sync for Config {}
 
-pub static TIPS: Lazy<Vec<String>> = Lazy::new(|| 
-    include_str!("tips.txt").split('\n')
-    //.map(str::to_owned)
-    .map(|s| format!("Tip: {}", s))
-    .collect());
+pub static TIPS: Lazy<Vec<String>> = Lazy::new(|| {
+    include_str!("tips.txt")
+        .split('\n')
+        //.map(str::to_owned)
+        .map(|s| format!("Tip: {}", s))
+        .collect()
+});
 
 bitflags! {
     #[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, Debug)]
@@ -30,6 +33,173 @@ pub enum ChallengeModeColor {
     Red,
     Golden,
     Rainbow,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HdrLayerSettings {
+    pub mode: String,
+    pub peak_nits: f32,
+    pub knee: f32,
+    pub power: f32,
+    pub shadow_gain: f32,
+    pub chroma_scale: f32,
+    pub gamut_clip: String,
+}
+
+impl Default for HdrLayerSettings {
+    fn default() -> Self {
+        Self {
+            mode: "sdr".into(),
+            peak_nits: 1000.,
+            knee: 0.70,
+            power: 1.70,
+            shadow_gain: 1.0,
+            chroma_scale: 1.0,
+            gamut_clip: "hard".into(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HdrSettings {
+    pub block_area: HdrLayerSettings,
+    pub note: HdrLayerSettings,
+    pub background: HdrLayerSettings,
+    pub ui: HashMap<String, HdrLayerSettings>,
+}
+
+impl Default for HdrSettings {
+    fn default() -> Self {
+        let default_layer = HdrLayerSettings::default();
+        let ui = [
+            "score",
+            "combo",
+            "name",
+            "level",
+            "line",
+            "pb",
+            "pause",
+            "progressText",
+            "timeText",
+            "bar",
+            "scoreAim",
+            "watermark",
+        ]
+        .into_iter()
+        .map(|key| (key.to_owned(), default_layer.clone()))
+        .collect();
+        Self {
+            block_area: default_layer.clone(),
+            note: default_layer.clone(),
+            background: default_layer,
+            ui,
+        }
+    }
+}
+
+/// Map one SDR channel into linear light normalized to 100 nits.
+/// `mode=sdr` preserves reference-white luminance, while mapped/custom modes
+/// apply a bounded highlight shoulder without changing black.
+pub fn hdr_map_channel(value: f32, settings: &HdrLayerSettings) -> f32 {
+    let value = value.max(0.0);
+    if settings.mode == "sdr" {
+        return value;
+    }
+    let peak = (settings.peak_nits.max(100.0) / 100.0).max(1.0);
+    let gain = settings.shadow_gain.max(0.0);
+    let x = value * gain;
+    let knee = settings.knee.clamp(0.01, 0.99);
+    if settings.mode == "mapped" {
+        return x * peak;
+    }
+    let power = settings.power.clamp(0.1, 8.0);
+    if x <= knee {
+        return x;
+    }
+    let source_span = (1.0 - knee).max(f32::EPSILON);
+    let output_span = (peak - knee).max(0.0);
+    let t = ((x - knee) / source_span).clamp(0.0, 1.0);
+    let shaped = 1.0 - (1.0 - t).powf(power);
+    let mut mapped = knee + shaped * output_span;
+    if settings.gamut_clip == "soft" {
+        mapped = peak * (mapped / peak).max(0.0).tanh() / peak.tanh();
+    }
+    mapped.min(peak)
+}
+
+/// Convert display-referred sRGB bytes to linear BT.2020 light with 1.0 = 100 nits.
+pub fn hdr_map_srgb(rgb: [u8; 3], settings: &HdrLayerSettings) -> [f32; 3] {
+    let linear = rgb.map(|channel| {
+        let v = channel as f32 / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    });
+    let mapped = linear.map(|channel| hdr_map_channel(channel, settings));
+    let mut bt2020 = [
+        0.6274 * mapped[0] + 0.3293 * mapped[1] + 0.0433 * mapped[2],
+        0.0691 * mapped[0] + 0.9195 * mapped[1] + 0.0114 * mapped[2],
+        0.0164 * mapped[0] + 0.0880 * mapped[1] + 0.8956 * mapped[2],
+    ];
+    let luma = 0.2627 * bt2020[0] + 0.6780 * bt2020[1] + 0.0593 * bt2020[2];
+    let chroma = settings.chroma_scale.max(0.0);
+    for channel in &mut bt2020 {
+        *channel = luma + (*channel - luma) * chroma;
+        if settings.gamut_clip == "soft" {
+            let peak = (settings.peak_nits.max(100.0) / 100.0).max(1.0);
+            *channel = peak * (*channel / peak).tanh() / peak.tanh();
+        } else {
+            *channel = channel.max(0.0);
+        }
+    }
+    bt2020
+}
+
+#[cfg(test)]
+mod hdr_tests {
+    use super::*;
+
+    #[test]
+    fn sdr_layer_keeps_reference_white_at_100_nits() {
+        let settings = HdrLayerSettings::default();
+        assert_eq!(hdr_map_channel(1.0, &settings), 1.0);
+        assert!(hdr_map_srgb([255; 3], &settings).iter().all(|channel| (*channel - 1.0).abs() < 0.002));
+    }
+
+    #[test]
+    fn mapped_layer_scales_linear_light_by_peak() {
+        let settings = HdrLayerSettings {
+            mode: "mapped".into(),
+            ..Default::default()
+        };
+        assert_eq!(hdr_map_channel(0.5, &settings), 5.0);
+    }
+
+    #[test]
+    fn custom_layer_is_bounded_and_monotonic() {
+        let settings = HdrLayerSettings {
+            mode: "custom".into(),
+            ..Default::default()
+        };
+        assert_eq!(hdr_map_channel(0.5, &settings), 0.5);
+        assert_eq!(hdr_map_channel(1.0, &settings), 10.0);
+        let values = [0.0, 0.5, 1.0, 2.0, 20.0].map(|v| hdr_map_channel(v, &settings));
+        assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(values.iter().all(|v| *v <= 10.0));
+    }
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackgroundVideoPlayback {
+    #[default]
+    Normal,
+    Repeat,
+    Stretch,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -72,6 +242,25 @@ pub struct Config {
     pub show_time_text: bool,
     pub watermark: String,
     pub background: bool,
+    /// Background source selected by the renderer (`chart`, `solid`, `video`, `none`).
+    pub background_mode: String,
+    /// Linearized RGBA color for a solid background.
+    pub background_color: [f32; 4],
+    /// Optional local video path used as the export/playback background.
+    pub background_video: Option<String>,
+    pub background_video_playback: BackgroundVideoPlayback,
+    #[serde(skip)]
+    pub background_video_interval: Option<(f64, f64)>,
+    #[serde(skip)]
+    pub transparent_background: bool,
+    /// Render into linear-light HDR targets when the host has negotiated an HDR output.
+    #[serde(skip)]
+    pub hdr_output: bool,
+    /// Transfer function requested for gameplay and preview presentation.
+    /// Unsupported HDR displays keep the SDR presentation path.
+    pub color_space: String,
+    /// Per-layer mapping controls used when HDR presentation is available.
+    pub hdr_settings: HdrSettings,
     //test
     pub touch_debug: bool,
     pub volume_music: f32,
@@ -155,6 +344,15 @@ impl Default for Config {
             volume_bgm: 1.,
             watermark: "".to_string(),
             background: false,
+            background_mode: "chart".to_owned(),
+            background_color: [0., 0., 0., 1.],
+            background_video: None,
+            background_video_playback: BackgroundVideoPlayback::Normal,
+            background_video_interval: None,
+            transparent_background: false,
+            hdr_output: false,
+            color_space: "rec709".to_owned(),
+            hdr_settings: HdrSettings::default(),
             disable_loading: false,
             target_audio: 96000,
 

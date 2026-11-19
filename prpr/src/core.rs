@@ -47,6 +47,7 @@ pub use object::{CtrlObject, Object};
 
 mod render;
 pub use render::{begin_readback_cycle, MSRenderTarget};
+pub use crate::config::{hdr_map_channel, hdr_map_srgb};
 
 mod rhythm_composite;
 pub use rhythm_composite::RhythmComposite;

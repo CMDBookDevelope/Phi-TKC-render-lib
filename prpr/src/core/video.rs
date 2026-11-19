@@ -1,16 +1,18 @@
 use super::{Anim, Resource};
 use crate::ext::{source_of_image, ScaleType};
-use anyhow::Result;
+use anyhow::{ensure, Context, Result};
 use macroquad::prelude::*;
-use macroquad::miniquad::{FilterMode, MipmapFilter, Texture, TextureFormat, TextureParams, TextureWrap};
+use macroquad::miniquad::{FilterMode, MipmapFilter, Texture, TextureAccess, TextureFormat, TextureParams, TextureWrap};
 use prpr_avc::AVPixelFormat;
 use std::collections::VecDeque;
 use std::io::Write;
+use std::path::PathBuf;
 use tempfile::NamedTempFile;
 
 #[derive(Debug, Clone)]
 struct FrameData {
     frame_index: usize,
+    timestamp: f64,
     buf_y: Vec<u8>,
     buf_u: Vec<u8>,
     buf_v: Vec<u8>,
@@ -18,7 +20,8 @@ struct FrameData {
 
 pub struct Video {
     video: prpr_avc::Video,
-    _video_file: NamedTempFile,
+    source: PathBuf,
+    _video_file: Option<NamedTempFile>,
 
     material: Material,
     tex_y: Texture2D,
@@ -36,14 +39,20 @@ pub struct Video {
     current_video_frame: usize,
     pub next_frame: usize,
     ended: bool,
+    first_timestamp: Option<f64>,
+    last_timestamp: Option<f64>,
+    displayed_timestamp: Option<f64>,
+    background_visible: bool,
+    last_background_time: Option<f64>,
+    last_cycle: u64,
+    duration: Option<f64>,
 
     // 异步解码配置
     max_cache_size: usize,
     decode_ahead_frames: usize,
 
-    // 视频信息
-    //width: u32,
-    //height: u32,
+    width: usize,
+    height: usize,
 
     // 缓冲区重用
     buf_y: Vec<u8>,
@@ -52,8 +61,10 @@ pub struct Video {
 }
 
 fn new_tex(w: u32, h: u32) -> Texture2D {
-    Texture2D::from_miniquad_texture(Texture::new_render_texture(
+    Texture2D::from_miniquad_texture(Texture::new(
         unsafe { get_internal_gl() }.quad_context,
+        TextureAccess::Static,
+        None,
         TextureParams {
             width: w,
             height: h,
@@ -77,18 +88,37 @@ impl Video {
         video_file.write_all(&data)?;
         drop(data);
 
-        let video = prpr_avc::Video::open(
-            video_file.path().as_os_str().to_str().unwrap(),
-            AVPixelFormat::YUV420P,
-        )?;
+        Self::open(video_file.path().to_path_buf(), Some(video_file), start_time, scale_type, alpha, dim)
+    }
+
+    pub(crate) fn open_background(path: PathBuf) -> Result<Self> {
+        Self::open(path, None, 0., ScaleType::CropCenter, Anim::fixed(1.), Anim::fixed(0.))
+    }
+
+    fn open(
+        source: PathBuf,
+        video_file: Option<NamedTempFile>,
+        start_time: f32,
+        scale_type: ScaleType,
+        alpha: Anim<f32>,
+        dim: Anim<f32>,
+    ) -> Result<Self> {
+        let video = Self::open_decoder(&source)?;
 
         let frame_delta = video.frame_rate().to_f64_inv();
+        let frame_delta = if frame_delta.is_finite() && frame_delta > 0. {
+            frame_delta
+        } else {
+            1. / 30.
+        };
+        let duration = video.duration();
         let format = video.stream_format();
+        ensure!(format.width > 0 && format.height > 0, "background video has invalid dimensions");
         let w = format.width as u32;
         let h = format.height as u32;
 
-        let buf_size_y = (w * h) as usize;
-        let buf_size_uv = ((w / 2) * (h / 2)) as usize;
+        let buf_size_y = w as usize * h as usize;
+        let buf_size_uv = w.div_ceil(2) as usize * h.div_ceil(2) as usize;
         let buf_y = vec![0; buf_size_y];
         let buf_u = vec![0; buf_size_uv];
         let buf_v = vec![0; buf_size_uv];
@@ -103,14 +133,15 @@ impl Video {
             },
         )?;
         let tex_y = new_tex(w, h);
-        let tex_u = new_tex(w / 2, h / 2);
-        let tex_v = new_tex(w / 2, h / 2);
+        let tex_u = new_tex(w.div_ceil(2), h.div_ceil(2));
+        let tex_v = new_tex(w.div_ceil(2), h.div_ceil(2));
         material.set_texture("tex_y", tex_y);
         material.set_texture("tex_u", tex_u);
         material.set_texture("tex_v", tex_v);
 
         Ok(Self {
             video,
+            source,
             _video_file: video_file,
             material,
             tex_y,
@@ -125,14 +156,26 @@ impl Video {
             current_video_frame: 0,
             next_frame: 0,
             ended: false,
+            first_timestamp: None,
+            last_timestamp: None,
+            displayed_timestamp: None,
+            background_visible: false,
+            last_background_time: None,
+            last_cycle: 0,
+            duration,
             max_cache_size: 10, // 最多缓存10帧
             decode_ahead_frames: 3, // 提前解码3帧
-            //width: w,
-            //height: h,
+            width: w as usize,
+            height: h as usize,
             buf_y,
             buf_u,
             buf_v,
         })
+    }
+
+    fn open_decoder(source: &std::path::Path) -> Result<prpr_avc::Video> {
+        let path = source.to_str().context("video path is not valid UTF-8")?;
+        prpr_avc::Video::open(path, AVPixelFormat::YUV420P)
     }
 
     fn decode_frame_to_cache(&mut self) -> Result<bool> {
@@ -140,13 +183,21 @@ impl Video {
             return Ok(false);
         }
 
-        let frame_data = self.video.with_frame(|frame| {
-            self.buf_y.copy_from_slice(frame.data(0));
-            self.buf_u.copy_from_slice(frame.data_half(1));
-            self.buf_v.copy_from_slice(frame.data_half(2));
+        let frame_data = self.video.with_timed_frame(|frame, timestamp| {
+            let fallback = self.last_timestamp.map_or(0., |last| last + self.frame_delta);
+            let timestamp = timestamp.map_or(fallback, |pts| {
+                let first = self.first_timestamp.get_or_insert(pts - fallback);
+                (pts - *first).max(self.last_timestamp.unwrap_or(0.))
+            });
+            self.last_timestamp = Some(timestamp);
+            frame.copy_plane(0, self.width, self.height, &mut self.buf_y);
+            for (plane, buffer) in [(1, &mut self.buf_u), (2, &mut self.buf_v)] {
+                frame.copy_plane(plane, self.width.div_ceil(2), self.height.div_ceil(2), buffer);
+            }
 
             FrameData {
                 frame_index: self.current_video_frame,
+                timestamp,
                 buf_y: self.buf_y.clone(),
                 buf_u: self.buf_u.clone(),
                 buf_v: self.buf_v.clone(),
@@ -211,17 +262,96 @@ impl Video {
         self.ensure_frame_available(target_frame)?;
 
         // 查找并应用目标帧
-        if let Some(frame_data) = self.frame_cache.iter().find(|f| f.frame_index <= target_frame).cloned() {
+        if let Some(frame_data) = self.frame_cache.iter().rfind(|f| f.frame_index <= target_frame) {
             if frame_data.frame_index >= self.next_frame {
-                let ctx = unsafe { get_internal_gl() }.quad_context;
-                self.tex_y.raw_miniquad_texture_handle().update(ctx, &frame_data.buf_y);
-                self.tex_u.raw_miniquad_texture_handle().update(ctx, &frame_data.buf_u);
-                self.tex_v.raw_miniquad_texture_handle().update(ctx, &frame_data.buf_v);
+                self.upload_frame(frame_data);
                 self.next_frame = frame_data.frame_index + 1;
             }
         }
 
         Ok(())
+    }
+
+    fn upload_frame(&self, frame: &FrameData) {
+        let ctx = unsafe { get_internal_gl() }.quad_context;
+        for (texture, buffer) in [
+            (self.tex_y, &frame.buf_y), (self.tex_u, &frame.buf_u), (self.tex_v, &frame.buf_v),
+        ] {
+            texture.raw_miniquad_texture_handle().update(ctx, buffer);
+        }
+    }
+
+    fn rewind(&mut self) -> Result<()> {
+        self.video = Self::open_decoder(&self.source)?;
+        self.frame_cache.clear();
+        self.current_video_frame = 0;
+        self.next_frame = 0;
+        self.ended = false;
+        self.last_timestamp = None;
+        self.first_timestamp = None;
+        self.displayed_timestamp = None;
+        Ok(())
+    }
+
+    pub(crate) fn duration(&self) -> Option<f64> {
+        self.duration
+    }
+
+    pub(crate) fn update_background(&mut self, elapsed: f64, repeat: bool) -> Result<bool> {
+        self.background_visible = false;
+        if elapsed < 0. {
+            return Ok(false);
+        }
+        let (time, cycle) = if let Some(duration) = self.duration {
+            if repeat {
+                (elapsed.rem_euclid(duration), (elapsed / duration) as u64)
+            } else if elapsed >= duration {
+                return Ok(false);
+            } else {
+                (elapsed, 0)
+            }
+        } else {
+            (elapsed, 0)
+        };
+        if cycle != self.last_cycle || self.last_background_time.is_some_and(|old| old > time) {
+            self.rewind()?;
+        }
+        self.last_cycle = cycle;
+        self.last_background_time = Some(time);
+
+        let mut latest = None;
+        loop {
+            if self.frame_cache.is_empty() && !self.decode_frame_to_cache()? {
+                break;
+            }
+            if self.frame_cache.front().is_some_and(|frame| frame.timestamp > time) {
+                break;
+            }
+            latest = self.frame_cache.pop_front();
+        }
+        if self.ended && self.duration.is_none() {
+            if let Some(last) = self.last_timestamp {
+                self.duration = Some(last + self.frame_delta);
+                if repeat && elapsed >= self.duration.unwrap() {
+                    return self.update_background(elapsed, true);
+                }
+            }
+        }
+        if self.ended && self.duration.is_some_and(|end| time >= end) {
+            return Ok(false);
+        }
+        if let Some(frame) = latest {
+            self.upload_frame(&frame);
+            self.displayed_timestamp = Some(frame.timestamp);
+        }
+        self.background_visible = self.displayed_timestamp.is_some();
+        Ok(self.background_visible)
+    }
+
+    pub(crate) fn render_background(&self, aspect_ratio: f32) {
+        if self.background_visible {
+            self.draw(aspect_ratio, 1., 0.);
+        }
     }
 
     pub fn render(&self, res: &Resource) {
@@ -234,12 +364,16 @@ impl Video {
             return;
         }
 
-        let top = 1. / res.aspect_ratio;
+        self.draw(res.aspect_ratio, alpha, self.dim.now());
+    }
+
+    fn draw(&self, aspect_ratio: f32, alpha: f32, dim: f32) {
+        let top = 1. / aspect_ratio;
         let r = Rect::new(-1., -top, 2., top * 2.);
 
         gl_use_material(self.material);
         let s = source_of_image(&self.tex_y, r, self.scale_type).unwrap_or_else(|| Rect::new(0., 0., 1., 1.));
-        let dim = 1. - self.dim.now();
+        let dim = 1. - dim;
         let color = Color::new(dim, dim, dim, alpha);
         let vertices = [
             Vertex::new(r.x, r.y, 0., s.x, s.y, color),
@@ -260,6 +394,15 @@ impl Video {
 
     pub fn set_decode_ahead_frames(&mut self, frames: usize) {
         self.decode_ahead_frames = frames;
+    }
+}
+
+impl Drop for Video {
+    fn drop(&mut self) {
+        self.material.delete();
+        self.tex_y.delete();
+        self.tex_u.delete();
+        self.tex_v.delete();
     }
 }
 
@@ -301,18 +444,10 @@ layout(set = 0, binding = 5) uniform sampler2D tex_v;
 layout(location = 0) out vec4 FragColor;
 
 void main() {
-    vec3 yuv = vec3(
-        texture(tex_y, uv).a,
-        texture(tex_u, uv).a - 0.5,
-        texture(tex_v, uv).a - 0.5
-    );
-    yuv.x = 1.1643 * (yuv.x - 0.0625);
-    mat3 color_matrix = mat3(
-        vec3(1.0,   0.0,     1.402),
-        vec3(1.0,  -0.344,  -0.714),
-        vec3(1.0,   1.772,   0.0  )
-    );
-
-    FragColor = vec4(yuv * color_matrix, 1.0) * color;
+    float y = (texture(tex_y, uv).a * 255.0 - 16.0) / 219.0;
+    float u = (texture(tex_u, uv).a * 255.0 - 128.0) / 224.0;
+    float v = (texture(tex_v, uv).a * 255.0 - 128.0) / 224.0;
+    vec3 rgb = vec3(y + 1.402 * v, y - 0.344136 * u - 0.714136 * v, y + 1.772 * u);
+    FragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0) * color;
 }"#;
 }

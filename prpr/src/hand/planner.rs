@@ -381,15 +381,22 @@ fn rotate(pos: Vector, rotation: f32) -> Vector {
     Vector::new(pos.x * cos - pos.y * sin, pos.x * sin + pos.y * cos)
 }
 
-pub(crate) fn assign_chart(lines: &mut [JudgeLine], config: &Config, aspect: f32) {
-    let started = std::time::Instant::now();
+pub(crate) fn hit_positions(lines: &[JudgeLine], config: &Config, aspect: f32) -> Vec<Vector> {
     let mut projection = Projection::new(lines.len(), aspect.max(0.001));
-    let mut targets = Vec::with_capacity(lines.iter().map(|line| line.notes.len()).sum());
+    let mut positions = Vec::with_capacity(lines.iter().map(|line| line.notes.len()).sum());
     for (line_id, line) in lines.iter().enumerate() {
         for note in &line.notes {
-            targets.push(target(note, projection.note(lines, line_id, note, config)));
+            positions.push(projection.note(lines, line_id, note, config));
         }
     }
+    positions
+}
+
+pub(crate) fn assign_chart(lines: &mut [JudgeLine], config: &Config, aspect: f32) {
+    let started = std::time::Instant::now();
+    let positions = hit_positions(lines, config, aspect);
+    let targets: Vec<_> = lines.iter().flat_map(|line| &line.notes)
+        .zip(positions).map(|(note, position)| target(note, position)).collect();
     let hands = plan(&targets, &MODEL);
     let left = hands.iter().filter(|&&hand| hand == Hand::Left).count();
     let right = hands.len() - left;

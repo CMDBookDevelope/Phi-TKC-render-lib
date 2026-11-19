@@ -3,12 +3,12 @@ use crate::{
     config::Config,
     ext::{create_audio_manger, nalgebra_to_glm, SafeTexture},
     fs::FileSystem,
-    info::{ChartInfo,ChartFormat},
+    info::{ChartFormat, ChartInfo},
     particle::{AtlasConfig, ColorCurve, Emitter, EmitterConfig},
 };
 use anyhow::{bail, Context, Result};
-use macroquad::prelude::*;
 use macroquad::miniquad::{FilterMode, Texture, TextureWrap};
+use macroquad::prelude::*;
 use sasa::{AudioClip, AudioManager, Sfx};
 use serde::Deserialize;
 use std::{cell::RefCell, ops::DerefMut, path::Path, sync::atomic::AtomicU32};
@@ -205,7 +205,8 @@ impl ResourcePack {
     pub async fn load(fs: &mut dyn FileSystem) -> Result<Self> {
         macro_rules! load_tex {
             ($path:literal) => {
-                SafeTexture::from(image::load_from_memory(&fs.load_file($path).await.with_context(|| format!("Missing {}", $path))?)?).with_filter(FilterMode::Linear)
+                SafeTexture::from(image::load_from_memory(&fs.load_file($path).await.with_context(|| format!("Missing {}", $path))?)?)
+                    .with_filter(FilterMode::Linear)
             };
         }
         let info: ResPackInfo = serde_yaml::from_str(&String::from_utf8(fs.load_file("info.yml").await.context("Missing info.yml")?)?)?;
@@ -343,7 +344,9 @@ impl ParticleEmitter {
 }
 
 #[derive(Default)]
-pub struct NoteBuffer { buckets: Vec<NoteBucket>, }
+pub struct NoteBuffer {
+    buckets: Vec<NoteBucket>,
+}
 
 struct NoteBucket {
     key: (i8, u32),
@@ -384,10 +387,12 @@ impl NoteBuffer {
 
     pub fn draw_all(&mut self) {
         static INDICES: once_cell::sync::Lazy<Vec<u16>> = once_cell::sync::Lazy::new(|| {
-            (0..DRAWCALL_QUADS as u16).flat_map(|it| {
-                let i = it * 4;
-                [i, i + 1, i + 2, i, i + 2, i + 3]
-            }).collect()
+            (0..DRAWCALL_QUADS as u16)
+                .flat_map(|it| {
+                    let i = it * 4;
+                    [i, i + 1, i + 2, i, i + 2, i + 3]
+                })
+                .collect()
         });
         let mut gl = unsafe { get_internal_gl() };
         gl.flush();
@@ -420,8 +425,8 @@ pub struct Resource {
     pub sfx_flick: Sfx,
     pub info: ChartInfo,
     pub aspect_ratio: f32,
-    pub inv_aspect_ratio: f32,  // 缓存的 aspect_ratio 倒数
-    pub chart_ratio_inv: f32,   // 缓存的 chart_ratio 倒数
+    pub inv_aspect_ratio: f32, // 缓存的 aspect_ratio 倒数
+    pub chart_ratio_inv: f32,  // 缓存的 chart_ratio 倒数
     pub dpi: u32,
     pub last_vp: (i32, i32, i32, i32),
     pub note_width: f32,
@@ -446,6 +451,11 @@ pub struct Resource {
     pub emitter: ParticleEmitter,
 
     pub chart_target: Option<MSRenderTarget>,
+    pub background_target: Option<MSRenderTarget>,
+    pub hdr_scene_target: Option<MSRenderTarget>,
+    pub hdr_block_target: Option<MSRenderTarget>,
+    pub hdr_line_target: Option<MSRenderTarget>,
+    pub hdr_ui_target: Option<MSRenderTarget>,
     pub no_effect: bool,
     /// Refraction needs a resolved scene even when ordinary effects and MSAA are disabled.
     pub(crate) has_block_effect: bool,
@@ -581,6 +591,11 @@ impl Resource {
             sfx_flick,
 
             chart_target: None,
+            background_target: None,
+            hdr_scene_target: None,
+            hdr_block_target: None,
+            hdr_line_target: None,
+            hdr_ui_target: None,
             no_effect,
             has_block_effect,
 
@@ -612,11 +627,35 @@ impl Resource {
         if width <= 0 || height <= 0 {
             return false;
         }
-        if !self.no_effect || self.config.sample_count != 1 || self.has_block_effect {
-            self.chart_target = Some(MSRenderTarget::new(
-                (width as u32, height as u32),
-                self.config.sample_count
-            ));
+        if self.config.hdr_output || !self.no_effect || self.config.sample_count != 1 || self.has_block_effect {
+            let size = (width as u32, height as u32);
+            self.chart_target = Some(if self.config.hdr_output {
+                MSRenderTarget::new_hdr(size, self.config.sample_count)
+            } else if self.config.transparent_background {
+                MSRenderTarget::new_rgba(size, self.config.sample_count)
+            } else {
+                MSRenderTarget::new(size, self.config.sample_count)
+            });
+        }
+        if self.config.hdr_output {
+            let size = (width as u32, height as u32);
+            if self.background_target.as_ref().map(MSRenderTarget::dimensions) != Some(size) {
+                self.background_target = Some(MSRenderTarget::new_hdr(size, 1));
+            }
+            if self.hdr_ui_target.as_ref().map(MSRenderTarget::dimensions) != Some(size) {
+                self.hdr_ui_target = Some(MSRenderTarget::new_hdr(size, 1));
+            }
+            if self.hdr_scene_target.as_ref().map(MSRenderTarget::dimensions) != Some(size) {
+                self.hdr_scene_target = Some(MSRenderTarget::new_hdr(size, 1));
+                self.hdr_line_target = Some(MSRenderTarget::new_hdr(size, self.config.sample_count));
+                self.hdr_block_target = self.has_block_effect.then(|| MSRenderTarget::new_hdr(size, 1));
+            }
+        } else {
+            self.background_target = None;
+            self.hdr_scene_target = None;
+            self.hdr_block_target = None;
+            self.hdr_ui_target = None;
+            self.hdr_line_target = None;
         }
         // The destination viewport is the only source of the canvas shape.
         // Legacy chart/config aspect fields must never crop the render target.
@@ -688,12 +727,23 @@ mod tests {
                 }
                 buffer.append(&part);
             }
-            let actual: Vec<_> = buffer.buckets.iter()
+            let actual: Vec<_> = buffer
+                .buckets
+                .iter()
                 .filter(|bucket| !bucket.vertices.is_empty())
-                .map(|bucket| (bucket.key, bucket.vertices.iter().map(|v| {
-                    let (position, _, _): ([f32; 3], [f32; 2], [f32; 4]) = (*v).into();
-                    position[0]
-                }).collect::<Vec<_>>()))
+                .map(|bucket| {
+                    (
+                        bucket.key,
+                        bucket
+                            .vertices
+                            .iter()
+                            .map(|v| {
+                                let (position, _, _): ([f32; 3], [f32; 2], [f32; 4]) = (*v).into();
+                                position[0]
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
                 .collect();
             assert_eq!(actual, reference.iter().map(|(key, values)| (*key, values.clone())).collect::<Vec<_>>());
         }

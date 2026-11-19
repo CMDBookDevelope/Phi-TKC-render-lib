@@ -70,6 +70,10 @@ impl TimeManager {
         (self.get_time_fn)()
     }
 
+    pub(crate) fn unscaled_time(&self) -> f64 {
+        self.pause_time.unwrap_or_else(&self.get_time_fn)
+    }
+
     pub fn reset(&mut self) {
         self.start_time = self.real_time();
         self.pause_time = None;
@@ -86,7 +90,7 @@ impl TimeManager {
 
     #[must_use]
     pub fn now(&self) -> f64 {
-        (self.pause_time.unwrap_or_else(&self.get_time_fn) - self.start_time) * self.speed
+        (self.unscaled_time() - self.start_time) * self.speed
     }
 
     pub fn update(&mut self, music_time: f64) {

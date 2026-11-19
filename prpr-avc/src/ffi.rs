@@ -3,7 +3,7 @@ use std::ffi::c_void;
 #[link(name = "avformat", kind = "static")]
 extern "C" {
     pub fn avformat_alloc_context() -> *mut AVFormatContext;
-    pub fn avformat_free_context(s: *mut AVFormatContext);
+    pub fn avformat_close_input(s: *mut *mut AVFormatContext);
     pub fn avformat_open_input(
         ps: *mut *mut AVFormatContext,
         url: *const ::std::os::raw::c_char,
@@ -30,6 +30,8 @@ extern "C" {
     pub fn avcodec_parameters_to_context(codec: *mut AVCodecContext, par: *const AVCodecParameters) -> ::std::os::raw::c_int;
     pub fn avcodec_open2(avctx: *mut AVCodecContext, codec: *const AVCodec, options: *mut *mut c_void) -> ::std::os::raw::c_int;
     pub fn av_packet_alloc() -> *mut AVPacket;
+    pub fn av_packet_free(pkt: *mut *mut AVPacket);
+    pub fn av_packet_unref(pkt: *mut AVPacket);
     pub fn avcodec_send_packet(avctx: *mut AVCodecContext, avpkt: *const AVPacket) -> ::std::os::raw::c_int;
     pub fn avcodec_receive_frame(avctx: *mut AVCodecContext, frame: *mut AVFrame) -> ::std::os::raw::c_int;
     pub fn avcodec_default_get_format(s: *mut AVCodecContext, fmt: *const AVPixelFormat) -> AVPixelFormat;
@@ -37,6 +39,7 @@ extern "C" {
 
 #[link(name = "swscale", kind = "static")]
 extern "C" {
+    pub fn sws_freeContext(ctx: *mut SwsContext);
     pub fn sws_getContext(
         srcW: ::std::os::raw::c_int,
         srcH: ::std::os::raw::c_int,

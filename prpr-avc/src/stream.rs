@@ -10,7 +10,21 @@ impl AVStreamRef {
     }
 
     pub fn frame_rate(&self) -> AVRational {
-        unsafe { (*self.0).r_frame_rate.into() }
+        let stream = unsafe { &*self.0 };
+        if stream.avg_frame_rate.num > 0 && stream.avg_frame_rate.den > 0 {
+            stream.avg_frame_rate.into()
+        } else {
+            stream.r_frame_rate.into()
+        }
+    }
+
+    pub fn time_base(&self) -> f64 {
+        AVRational::from(unsafe { (*self.0).time_base }).to_f64()
+    }
+
+    pub fn duration(&self) -> Option<f64> {
+        let duration = unsafe { (*self.0).duration } as f64 * self.time_base();
+        (duration.is_finite() && duration > 0.).then_some(duration)
     }
 
     pub fn is_video(&self) -> bool {

@@ -1,4 +1,4 @@
-use super::{draw_background, ending::RecordUpdateState, game::GameMode, GameScene, NextScene, Scene};
+use super::{ending::RecordUpdateState, game::GameMode, GameScene, NextScene, Scene, SceneBackground, SharedSceneBackground};
 use crate::{
     config::Config,
     core::Resource,
@@ -14,7 +14,7 @@ use ::rand::{seq::SliceRandom, thread_rng};
 use anyhow::{Context, Result};
 use macroquad::prelude::*;
 use regex::Regex;
-use std::sync::Arc;
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 use tracing::warn;
 
 const BEFORE_TIME: f32 = 1.;
@@ -33,11 +33,13 @@ pub struct BasicPlayer {
 pub struct LoadingScene {
     info: ChartInfo,
     background: SafeTexture,
+    scene_background: SharedSceneBackground,
     illustration: SafeTexture,
     pub load_task: LocalTask<Result<GameScene>>,
     next_scene: Option<NextScene>,
     finish_time: f32,
     target: Option<RenderTarget>,
+    hdr_frame: Option<crate::core::MSRenderTarget>,
     charter: String,
     config: Config,
 }
@@ -97,17 +99,21 @@ impl LoadingScene {
         if info.tip.is_none() {
             info.tip = Some(crate::config::TIPS.choose(&mut thread_rng()).unwrap().to_owned());
         }
-        let future = Box::pin(GameScene::new(mode, info.clone(), config.clone(), fs, player, background.clone(), illustration.clone(), upload_fn, update_fn));
+        let scene_background = Rc::new(RefCell::new(SceneBackground::new(&config)?));
+        let future = Box::pin(GameScene::new_with_background(mode, info.clone(), config.clone(), fs, player,
+            background.clone(), illustration.clone(), upload_fn, update_fn, Rc::clone(&scene_background)));
         let charter = Regex::new(r"\[!:[0-9]+:([^:]*)\]").unwrap().replace_all(&info.charter, "$1").to_string();
 
         Ok(Self {
             info,
             background,
+            scene_background,
             illustration,
             load_task: Some(future),
             next_scene: None,
             finish_time: f32::INFINITY,
             target: None,
+            hdr_frame: None,
             config,
             charter,
         })
@@ -149,6 +155,8 @@ impl Scene for LoadingScene {
         ui: &mut Ui,
         target: Option<RenderTarget>,
     ) -> Result<()> {
+        let output = target;
+        let target = super::hdr_scene_input(self.config.hdr_output, &mut self.hdr_frame, ui.viewport, output);
         let cam = ui.camera();
         let asp = -cam.zoom.y;
         let top = 1. / asp;
@@ -161,12 +169,12 @@ impl Scene for LoadingScene {
             ..Default::default()
         });
 
+        self.scene_background.borrow_mut().draw(*self.background, asp, tm.unscaled_time())?;
         if self.config.background {
             let main_width = 0.768;
             let main_height = main_width * (self.illustration.height() as f32 / self.illustration.width() as f32);
             let main = Rect::new(-main_width / 2.0, -main_height / 2.0, main_width, main_height);
 
-            draw_background(*self.background);
             draw_parallelogram(main, None, Color::new(0.0, 0.0, 0.0, 0.0), false);
 
             let _r = draw_illustration(
@@ -180,10 +188,10 @@ impl Scene for LoadingScene {
             );
 
 
+            super::finish_hdr_scene(&mut self.hdr_frame, ui.viewport, output);
             return Ok(());
         }
 
-        draw_background(*self.background);
         let dx = if now > self.finish_time {
             let p = ((now - self.finish_time) / TRANSITION_TIME).min(1.);
             p.powi(2) * 3. + p.powi(5) * 11.
@@ -269,6 +277,7 @@ impl Scene for LoadingScene {
         if dx != 0. {
             gl.pop_model_matrix();
         }
+        super::finish_hdr_scene(&mut self.hdr_frame, ui.viewport, output);
         Ok(())
     }
 

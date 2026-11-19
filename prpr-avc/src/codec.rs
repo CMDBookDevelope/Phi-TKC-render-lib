@@ -89,10 +89,14 @@ impl AVCodecContext {
         unsafe { handle(ffi::avcodec_send_packet(self.0 .0, packet.0 .0)) }
     }
 
+    pub fn send_eof(&mut self) -> AVResult<()> {
+        unsafe { handle(ffi::avcodec_send_packet(self.0 .0, std::ptr::null())) }
+    }
+
     pub fn receive_frame(&mut self, frame: &mut AVFrame) -> AVResult<bool> {
         unsafe {
             match handle(ffi::avcodec_receive_frame(self.0 .0, frame.0 .0)) {
-                Err(AVError { code, .. }) if code == -EAGAIN => return Ok(false),
+                Err(AVError { code, .. }) if code == -EAGAIN || code == -541478725 => return Ok(false),
                 x => {
                     x?;
                     Ok(true)

@@ -27,6 +27,11 @@ impl AVFormatContext {
         }
     }
 
+    pub fn duration(&self) -> Option<f64> {
+        let duration = unsafe { self.0.as_ref().duration };
+        (duration > 0).then_some(duration as f64 / 1_000_000.)
+    }
+
     pub fn read_frame(&mut self, frame: &mut AVPacket) -> AVResult<bool> {
         unsafe {
             match handle(ffi::av_read_frame(self.0 .0, frame.0 .0)) {
@@ -45,7 +50,7 @@ unsafe impl Send for AVFormatContext {}
 impl Drop for AVFormatContext {
     fn drop(&mut self) {
         unsafe {
-            ffi::avformat_free_context(self.0 .0);
+            ffi::avformat_close_input(self.0.as_self_mut());
         }
     }
 }

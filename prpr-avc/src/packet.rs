@@ -11,6 +11,16 @@ impl AVPacket {
     pub fn stream_index(&self) -> i32 {
         unsafe { self.0.as_ref().stream_index }
     }
+
+    pub fn unref(&mut self) {
+        unsafe { ffi::av_packet_unref(self.0 .0) }
+    }
 }
 
 unsafe impl Send for AVPacket {}
+
+impl Drop for AVPacket {
+    fn drop(&mut self) {
+        unsafe { ffi::av_packet_free(self.0.as_self_mut()) }
+    }
+}

@@ -30,12 +30,39 @@ pub struct RhythmComposite {
     pub layout: RhythmLayout,
     strip: Option<RhythmStrip>,
     strip_painter: Option<RefCell<TextPainter>>,
-    targets: Vec<(MSRenderTarget, MSRenderTarget)>,
+    targets: Vec<(RefCell<MSRenderTarget>, MSRenderTarget)>,
     frame_sample: Cell<RhythmFrameSample>,
+    preserve_alpha: bool,
+    hdr: bool,
 }
 
 impl RhythmComposite {
     pub fn new(width: u32, height: u32, strip: Option<RhythmStrip>, slots: usize) -> Result<Self> {
+        Self::new_with_alpha(width, height, strip, slots, false)
+    }
+
+    pub fn new_with_alpha(
+        width: u32,
+        height: u32,
+        strip: Option<RhythmStrip>,
+        slots: usize,
+        preserve_alpha: bool,
+    ) -> Result<Self> {
+        Self::with_format(width, height, strip, slots, preserve_alpha, false)
+    }
+
+    pub fn new_hdr(width: u32, height: u32, strip: Option<RhythmStrip>, slots: usize) -> Result<Self> {
+        Self::with_format(width, height, strip, slots, false, true)
+    }
+
+    fn with_format(
+        width: u32,
+        height: u32,
+        strip: Option<RhythmStrip>,
+        slots: usize,
+        preserve_alpha: bool,
+        hdr: bool,
+    ) -> Result<Self> {
         let layout = RhythmLayout::new(width, height, strip.is_some())?;
         // Keep the glyph cache local to this export's GPU context. Embedding the
         // licensed font also avoids platform-specific asset paths or fallbacks.
@@ -46,7 +73,23 @@ impl RhythmComposite {
         };
         let targets = if strip.is_some() {
             (0..slots)
-                .map(|_| (MSRenderTarget::new((width, layout.strip_height), 1), MSRenderTarget::new((width, layout.output_height), 1)))
+                .map(|_| {
+                    let strip = if hdr {
+                        MSRenderTarget::new_hdr((width, layout.strip_height), 1)
+                    } else if preserve_alpha {
+                        MSRenderTarget::new_rgba((width, layout.strip_height), 1)
+                    } else {
+                        MSRenderTarget::new((width, layout.strip_height), 1)
+                    };
+                    let output = if hdr {
+                        MSRenderTarget::new_hdr((width, layout.output_height), 1)
+                    } else if preserve_alpha {
+                        MSRenderTarget::new_rgba((width, layout.output_height), 1)
+                    } else {
+                        MSRenderTarget::new((width, layout.output_height), 1)
+                    };
+                    (RefCell::new(strip), output)
+                })
                 .collect()
         } else {
             Vec::new()
@@ -57,6 +100,8 @@ impl RhythmComposite {
             strip_painter,
             targets,
             frame_sample: Cell::new(RhythmFrameSample::default()),
+            preserve_alpha,
+            hdr,
         })
     }
 
@@ -67,6 +112,7 @@ impl RhythmComposite {
         let sample = self.frame_sample.get().advance(chart_time);
         self.frame_sample.set(sample);
         let (strip_target, output_target) = &self.targets[slot];
+        let mut strip_target = strip_target.borrow_mut();
         unsafe { get_internal_gl() }.flush();
         push_camera_state();
         let mut painter = self
@@ -81,13 +127,16 @@ impl RhythmComposite {
         clear_background(BLACK);
         strip.draw_sampled(sample.time.unwrap_or(0.), sample.previous_time, &mut ui);
         unsafe { get_internal_gl() }.flush();
+        if self.hdr {
+            strip_target.map_hdr(&crate::config::HdrLayerSettings::default());
+        }
 
         let width = self.layout.width as f32;
         let game_height = self.layout.game_height as f32;
         let mut camera = Camera2D::from_display_rect(Rect::new(0., 0., width, self.layout.output_height as f32));
         camera.render_target = Some(output_target.input());
         set_camera(&camera);
-        clear_background(BLACK);
+        clear_background(if self.preserve_alpha { Color::new(0., 0., 0., 0.) } else { BLACK });
         draw_texture_ex(
             game.output().texture,
             0.,

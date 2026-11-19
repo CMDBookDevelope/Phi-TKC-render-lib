@@ -45,3 +45,9 @@ impl SwsContext {
 }
 
 unsafe impl Send for SwsContext {}
+
+impl Drop for SwsContext {
+    fn drop(&mut self) {
+        unsafe { ffi::sws_freeContext(self.0 .0) };
+    }
+}

@@ -1,6 +1,6 @@
 crate::tl_file!("ending");
 
-use super::{draw_background, game::SimpleRecord, loading::UploadFn, NextScene, Scene};
+use super::{game::SimpleRecord, loading::UploadFn, NextScene, Scene, SceneBackground, SharedSceneBackground};
 use crate::{
     config::Config,
     ext::{
@@ -18,7 +18,7 @@ use anyhow::Result;
 use macroquad::prelude::*;
 use sasa::{AudioClip, AudioManager, Music, MusicParams};
 use serde::Deserialize;
-use std::{cell::RefCell, ops::DerefMut};
+use std::{cell::RefCell, ops::DerefMut, rc::Rc};
 
 #[derive(Deserialize)]
 pub struct RecordUpdateState {
@@ -30,12 +30,15 @@ pub struct RecordUpdateState {
 
 pub struct EndingScene {
     background: SafeTexture,
+    scene_background: SharedSceneBackground,
     illustration: SafeTexture,
     player: SafeTexture,
     icons: [SafeTexture; 8],
     icon_retry: SafeTexture,
     icon_proceed: SafeTexture,
     target: Option<RenderTarget>,
+    hdr_frame: Option<crate::core::MSRenderTarget>,
+    hdr_output: bool,
     audio: AudioManager,
     bgm: Music,
 
@@ -82,6 +85,29 @@ impl EndingScene {
         record_data: Option<Vec<u8>>,
         record: Option<SimpleRecord>,
     ) -> Result<Self> {
+        let scene_background = Rc::new(RefCell::new(SceneBackground::new(config)?));
+        Self::new_with_background(background, illustration, player, icons, icon_retry, icon_proceed,
+            info, result, challenge_texture, config, bgm, upload_fn, player_rks, record_data, record, scene_background)
+    }
+
+    pub(crate) fn new_with_background(
+        background: SafeTexture,
+        illustration: SafeTexture,
+        player: SafeTexture,
+        icons: [SafeTexture; 8],
+        icon_retry: SafeTexture,
+        icon_proceed: SafeTexture,
+        info: ChartInfo,
+        result: PlayResult,
+        challenge_texture: SafeTexture,
+        config: &Config,
+        bgm: AudioClip,
+        upload_fn: Option<UploadFn>,
+        player_rks: Option<f32>,
+        record_data: Option<Vec<u8>>,
+        record: Option<SimpleRecord>,
+        scene_background: SharedSceneBackground,
+    ) -> Result<Self> {
         let mut audio = create_audio_manger(config)?;
         let bgm = audio.create_music(
             bgm,
@@ -96,12 +122,15 @@ impl EndingScene {
             .and_then(|f| record_data.clone().map(|data| (f(data), show_message(tl!("uploading")).handle())));
         Ok(Self {
             background,
+            scene_background,
             illustration,
             player,
             icons,
             icon_retry,
             icon_proceed,
             target: None,
+            hdr_frame: None,
+            hdr_output: config.hdr_output,
             audio,
             bgm,
             update_state: if upload_task.is_some() {
@@ -241,6 +270,8 @@ impl Scene for EndingScene {
         const START3: f32 = 0.00;
         const END3: f32 = 1.20;
 
+        let output = target;
+        let target = super::hdr_scene_input(self.hdr_output, &mut self.hdr_frame, ui.viewport, output);
         let mut cam = ui.camera();
         let asp = -cam.zoom.y;
         let top = 1. / asp;
@@ -249,7 +280,7 @@ impl Scene for EndingScene {
         let res = &self.result;
         cam.render_target = target;
         set_camera(&cam);
-        draw_background(*self.background);
+        self.scene_background.borrow_mut().draw(*self.background, asp, tm.unscaled_time())?;
 
         fn ran(t: f32, l: f32, r: f32) -> f32 {
             ((t - l) / (r - l)).clamp(0., 1.)
@@ -470,6 +501,7 @@ impl Scene for EndingScene {
             .color(color)
             .draw();
 
+        super::finish_hdr_scene(&mut self.hdr_frame, ui.viewport, output);
         Ok(())
     }
 

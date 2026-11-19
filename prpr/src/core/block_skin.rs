@@ -4,7 +4,7 @@ use super::{BlockArea, BlockPhase, Vector};
 use crate::fs::FileSystem;
 use anyhow::{bail, Context, Result};
 use macroquad::{
-    miniquad::{PipelineParams, TextureWrap, UniformType},
+    miniquad::{PipelineParams, TextureFormat, TextureWrap, UniformType},
     prelude::*,
 };
 use once_cell::sync::Lazy;
@@ -96,10 +96,16 @@ struct Frame {
     origin: Vec2,
 }
 impl Frame {
-    fn new(width: usize, height: usize, spec: &TargetSpec, padding: Vec2) -> Self {
+    fn new(width: usize, height: usize, spec: &TargetSpec, padding: Vec2, hdr: bool) -> Self {
         let logical = vec2((width as f32 * spec.scale_x).floor().max(1.), (height as f32 * spec.scale_y).floor().max(1.));
         let origin = vec2((padding.x * logical.x / width as f32).ceil(), (padding.y * logical.y / height as f32).ceil());
-        let target = render_target((logical.x + 2. * origin.x) as u32, (logical.y + 2. * origin.y) as u32);
+        let width = (logical.x + 2. * origin.x) as u32;
+        let height = (logical.y + 2. * origin.y) as u32;
+        let target = if hdr {
+            super::render::new_rt(width, height, TextureFormat::RGBA16F)
+        } else {
+            render_target(width, height)
+        };
         target.texture.set_filter(if spec.filter == "linear" {
             FilterMode::Linear
         } else {
@@ -132,6 +138,7 @@ struct Pair {
 struct Instance {
     width: usize,
     height: usize,
+    hdr: bool,
     screens: Pair,
     targets: HashMap<String, Pair>,
     mask: Frame,
@@ -431,7 +438,8 @@ impl NoiseSkin {
         };
         let width = scene.width() as usize;
         let height = scene.height() as usize;
-        if self.instance.as_ref().is_none_or(|i| i.width != width || i.height != height) {
+        let hdr = scene.raw_miniquad_texture_handle().format == TextureFormat::RGBA16F;
+        if self.instance.as_ref().is_none_or(|i| i.width != width || i.height != height || i.hdr != hdr) {
             let padding = padding(graph.padding.as_ref(), width, height);
             let screen_padding = if graph.padding.as_ref().and_then(|p| p.get("screen")).and_then(Value::as_bool) == Some(false) {
                 Vec2::ZERO
@@ -447,6 +455,7 @@ impl NoiseSkin {
                         ..Default::default()
                     },
                     screen_padding,
+                    hdr,
                 ),
                 back: Frame::new(
                     width,
@@ -456,6 +465,7 @@ impl NoiseSkin {
                         ..Default::default()
                     },
                     screen_padding,
+                    hdr,
                 ),
                 history: None,
             };
@@ -466,19 +476,20 @@ impl NoiseSkin {
                     (
                         name.clone(),
                         Pair {
-                            front: Frame::new(width, height, spec, padding),
-                            back: Frame::new(width, height, spec, padding),
-                            history: spec.no_clear.then(|| Frame::new(width, height, spec, padding)),
+                            front: Frame::new(width, height, spec, padding, false),
+                            back: Frame::new(width, height, spec, padding, false),
+                            history: spec.no_clear.then(|| Frame::new(width, height, spec, padding, false)),
                         },
                     )
                 })
                 .collect();
-            let mask = Frame::new(width, height, &graph.block_mask, padding);
+            let mask = Frame::new(width, height, &graph.block_mask, padding, false);
             let mw = mask.target.texture.width() as u16;
             let mh = mask.target.texture.height() as u16;
             self.instance = Some(Instance {
                 width,
                 height,
+                hdr,
                 screens,
                 targets,
                 mask,

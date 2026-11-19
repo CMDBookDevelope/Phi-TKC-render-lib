@@ -3,10 +3,9 @@
 crate::tl_file!("game");
 
 use super::{
-    draw_background,
     ending::RecordUpdateState,
     loading::{BasicPlayer, UpdateFn, UploadFn},
-    request_input, return_input, show_message, take_input, EndingScene, NextScene, Scene,
+    request_input, return_input, show_message, take_input, EndingScene, NextScene, Scene, SceneBackground, SharedSceneBackground,
 };
 use crate::core::NoteKind;
 use crate::judge::{JudgeStatus, Judgement};
@@ -144,14 +143,14 @@ struct JudgementCounter {
 // 判定条，显示全局判定偏移
 #[derive(Clone)]
 struct JudgementBar {
-    diffs: Vec<f32>,         // 存储最近的判定偏移（毫秒）
-    max_diffs: usize,        // 最大存储数量
-    current_avg: f32,        // 当前平均偏移
-    target_avg: f32,         // 目标平均偏移（用于动画）
-    bar_width: f32,          // 条的宽度
-    bar_height: f32,         // 条的高度
-    bar_y: f32,              // 条的垂直位置
-    max_ms: f32,             // 最大显示毫秒数（±）
+    diffs: Vec<f32>,  // 存储最近的判定偏移（毫秒）
+    max_diffs: usize, // 最大存储数量
+    current_avg: f32, // 当前平均偏移
+    target_avg: f32,  // 目标平均偏移（用于动画）
+    bar_width: f32,   // 条的宽度
+    bar_height: f32,  // 条的高度
+    bar_y: f32,       // 条的垂直位置
+    max_ms: f32,      // 最大显示毫秒数（±）
 
     // 判定历史记录（用于显示垂直白条）
     history: Vec<(f32, f64)>, // (偏移毫秒, 创建时间)
@@ -280,16 +279,16 @@ impl JudgementBar {
     fn new() -> Self {
         Self {
             diffs: Vec::new(),
-            max_diffs: 20,           // 保存最近20次判定
+            max_diffs: 20, // 保存最近20次判定
             current_avg: 0.0,
             target_avg: 0.0,
             bar_width: 0.6,
             bar_height: 0.04,
             bar_y: 0.85,
-            max_ms: 100.0,           // ±100ms 范围
+            max_ms: 100.0, // ±100ms 范围
 
             history: Vec::new(),
-            history_duration: 0.2,   // 0.2秒后消失
+            history_duration: 0.2, // 0.2秒后消失
         }
     }
 
@@ -341,6 +340,7 @@ pub struct GameScene {
     player: Option<BasicPlayer>,
     info_offset: f32,
     effects: Vec<Effect>,
+    scene_background: SharedSceneBackground,
 
     first_in: bool,
     exercise_range: Range<f32>,
@@ -350,6 +350,7 @@ pub struct GameScene {
     pub music: Music,
     rhythm_strip: Option<RhythmStrip>,
     rhythm_painter: Option<TextPainter>,
+    hdr_rhythm_frame: Option<crate::core::MSRenderTarget>,
 
     state: State,
     pub last_update_time: f64,
@@ -371,8 +372,8 @@ pub struct GameScene {
     pub current_chart_ratio: f32, // 当前缩放比例
 
     // Score动画相关字段
-    pub actual_score: u32,      // 实际分数（judge中的真实值，立即更新）
-    pub display_score: u32,     // 显示分数（UI上显示的值，平滑过渡）
+    pub actual_score: u32,  // 实际分数（judge中的真实值，立即更新）
+    pub display_score: u32, // 显示分数（UI上显示的值，平滑过渡）
     pub current_speed: f32,
 
     //combo 动画相关字段
@@ -504,121 +505,120 @@ impl GameScene {
         }
     }
 
-
-        fn draw_judgement_bar(&self, ui: &mut Ui, tm: &TimeManager) {
-            if !self.res.config.bar {
-                return;
-            }
-            let bar = &self.judgement_bar;
-            // 使用屏幕坐标（-1 到 1），位置与名字同一行
-            let center_x = 0.0;
-            let top = -1. / self.res.aspect_ratio;
-            let eps = 2e-2 / self.res.aspect_ratio;
-            let center_y = -top - eps * 3.64;  // 与名字同一行（bt）
-            let half_width = 0.5;
-            let half_height = 0.02;
-
-            // 如果没有数据，显示空状态的判定条
-            let show_empty = bar.diffs.is_empty();
-            // 计算滑块位置（基于平均偏移）
-            let avg = if show_empty { 0.0 } else { bar.current_avg };
-            let slider_offset = (avg / bar.max_ms).clamp(-1.0, 1.0) * half_width;
-            let slider_x = center_x + slider_offset;
-            // 绘制背景条（灰色）
-            let bg_color = Color::new(0.3, 0.3, 0.3, 0.8 * self.res.alpha);
-            ui.fill_rect(
-                Rect::new(center_x - half_width, center_y - half_height, bar.bar_width, bar.bar_height),
-                bg_color,
-            );
-            // 绘制中心线（白色，表示完美判定）
-            let center_line_color = Color::new(1.0, 1.0, 1.0, 0.9 * self.res.alpha);
-            ui.fill_rect(
-                Rect::new(center_x - 0.002, center_y - half_height - 0.005, 0.004, bar.bar_height + 0.01),
-                center_line_color,
-            );
-            for i in -5..=5 {
-                if i == 0 {
-                    continue;
-                }
-                let tick_x = center_x + (i as f32 / 5.0) * half_width;
-                let tick_color = Color::new(0.6, 0.6, 0.6, 0.6 * self.res.alpha);
-                ui.fill_rect(
-                    Rect::new(tick_x - 0.001, center_y - half_height - 0.003, 0.002, bar.bar_height + 0.006),
-                    tick_color,
-                );
-                // 显示刻度数值
-                let ms = i32::abs(i * 20);
-                let text_color = Color::new(0.7, 0.7, 0.7, 0.7 * self.res.alpha);
-                ui.text(&format!("{}ms", ms))
-                    .pos(tick_x, center_y + half_height + 0.02)
-                    .anchor(0.5, 0.0)
-                    .size(0.15 / self.current_chart_ratio)
-                    .color(text_color)
-                    .draw();
-            }
-            // 绘制滑块（根据平均偏移颜色变化）
-            let slider_color = if show_empty || avg.abs() < 10.0 {
-                Color::new(0.0, 1.0, 0.5, 1.0)  // 绿色：接近完美
-            } else if avg.abs() < 30.0 {
-                Color::new(0.0, 0.8, 1.0, 1.0)  // 蓝色：Good 范围
-            } else if avg.abs() < 50.0 {
-                Color::new(1.0, 0.5, 0.0, 1.0)  // 橙色：Bad 范围
-            } else {
-                Color::new(1.0, 0.0, 0.0, 1.0)  // 红色：Miss 范围
-            };
-            let slider_color = Color::new(slider_color.r, slider_color.g, slider_color.b, slider_color.a * self.res.alpha);
-
-            ui.fill_rect(
-                Rect::new(slider_x - 0.015, center_y - half_height - 0.01, 0.03, bar.bar_height + 0.02),
-                slider_color,
-            );
-            // 显示当前平均偏移值
-            let avg_text = if show_empty {
-                "0.0ms".to_string()
-            } else if avg >= 0.0 {
-                format!("+{:.1}ms", avg)
-            } else {
-                format!("{:.1}ms", avg)
-            };
-            let avg_color = if show_empty || avg.abs() < 10.0 {
-                Color::new(0.0, 1.0, 0.5, 1.0)
-            } else if avg < 0.0 {
-                Color::new(1.0, 0.5, 0.0, 1.0)  // 早：橙色
-            } else {
-                Color::new(0.0, 0.8, 1.0, 1.0)  // 晚：蓝色
-            };
-
-            let avg_color = Color::new(avg_color.r, avg_color.g, avg_color.b, avg_color.a * self.res.alpha);
-            ui.text(&avg_text)
-                .pos(slider_x, center_y - half_height - 0.03)
-                .anchor(0.5, 1.0)
-                .size(0.2 / self.current_chart_ratio)
-                .color(avg_color)
-                .draw();
-            // 绘制历史记录（垂直白条）
-            for &(diff_ms, time) in &bar.history {
-                // 计算透明度（基于剩余时间）
-                let elapsed = tm.now() - time;
-                let progress = ((elapsed / bar.history_duration) as f32).min(1.0);
-                let alpha = 1.0 - progress;
-
-                if alpha <= 0.01 {
-                    continue;
-                }
-                // 计算位置
-                let history_offset = (diff_ms / bar.max_ms).clamp(-1.0, 1.0) * half_width;
-                let history_x = center_x + history_offset;
-                // 绘制垂直白条
-                let history_color = Color::new(1.0, 1.0, 1.0, alpha * 0.8 * self.res.alpha);
-                let history_height = half_height * 2.0 * (1.0 - progress * 0.5);  // 随时间缩小
-                ui.fill_rect(
-                    Rect::new(history_x - 0.003, center_y - history_height / 2.0, 0.006, history_height),
-                    history_color,
-                );
-            }
+    fn draw_judgement_bar(&self, ui: &mut Ui, tm: &TimeManager) {
+        if !self.res.config.bar {
+            return;
         }
+        let bar = &self.judgement_bar;
+        // 使用屏幕坐标（-1 到 1），位置与名字同一行
+        let center_x = 0.0;
+        let top = -1. / self.res.aspect_ratio;
+        let eps = 2e-2 / self.res.aspect_ratio;
+        let center_y = -top - eps * 3.64; // 与名字同一行（bt）
+        let half_width = 0.5;
+        let half_height = 0.02;
+
+        // 如果没有数据，显示空状态的判定条
+        let show_empty = bar.diffs.is_empty();
+        // 计算滑块位置（基于平均偏移）
+        let avg = if show_empty { 0.0 } else { bar.current_avg };
+        let slider_offset = (avg / bar.max_ms).clamp(-1.0, 1.0) * half_width;
+        let slider_x = center_x + slider_offset;
+        // 绘制背景条（灰色）
+        let bg_color = Color::new(0.3, 0.3, 0.3, 0.8 * self.res.alpha);
+        ui.fill_rect(Rect::new(center_x - half_width, center_y - half_height, bar.bar_width, bar.bar_height), bg_color);
+        // 绘制中心线（白色，表示完美判定）
+        let center_line_color = Color::new(1.0, 1.0, 1.0, 0.9 * self.res.alpha);
+        ui.fill_rect(Rect::new(center_x - 0.002, center_y - half_height - 0.005, 0.004, bar.bar_height + 0.01), center_line_color);
+        for i in -5..=5 {
+            if i == 0 {
+                continue;
+            }
+            let tick_x = center_x + (i as f32 / 5.0) * half_width;
+            let tick_color = Color::new(0.6, 0.6, 0.6, 0.6 * self.res.alpha);
+            ui.fill_rect(Rect::new(tick_x - 0.001, center_y - half_height - 0.003, 0.002, bar.bar_height + 0.006), tick_color);
+            // 显示刻度数值
+            let ms = i32::abs(i * 20);
+            let text_color = Color::new(0.7, 0.7, 0.7, 0.7 * self.res.alpha);
+            ui.text(&format!("{}ms", ms))
+                .pos(tick_x, center_y + half_height + 0.02)
+                .anchor(0.5, 0.0)
+                .size(0.15 / self.current_chart_ratio)
+                .color(text_color)
+                .draw();
+        }
+        // 绘制滑块（根据平均偏移颜色变化）
+        let slider_color = if show_empty || avg.abs() < 10.0 {
+            Color::new(0.0, 1.0, 0.5, 1.0) // 绿色：接近完美
+        } else if avg.abs() < 30.0 {
+            Color::new(0.0, 0.8, 1.0, 1.0) // 蓝色：Good 范围
+        } else if avg.abs() < 50.0 {
+            Color::new(1.0, 0.5, 0.0, 1.0) // 橙色：Bad 范围
+        } else {
+            Color::new(1.0, 0.0, 0.0, 1.0) // 红色：Miss 范围
+        };
+        let slider_color = Color::new(slider_color.r, slider_color.g, slider_color.b, slider_color.a * self.res.alpha);
+
+        ui.fill_rect(Rect::new(slider_x - 0.015, center_y - half_height - 0.01, 0.03, bar.bar_height + 0.02), slider_color);
+        // 显示当前平均偏移值
+        let avg_text = if show_empty {
+            "0.0ms".to_string()
+        } else if avg >= 0.0 {
+            format!("+{:.1}ms", avg)
+        } else {
+            format!("{:.1}ms", avg)
+        };
+        let avg_color = if show_empty || avg.abs() < 10.0 {
+            Color::new(0.0, 1.0, 0.5, 1.0)
+        } else if avg < 0.0 {
+            Color::new(1.0, 0.5, 0.0, 1.0) // 早：橙色
+        } else {
+            Color::new(0.0, 0.8, 1.0, 1.0) // 晚：蓝色
+        };
+
+        let avg_color = Color::new(avg_color.r, avg_color.g, avg_color.b, avg_color.a * self.res.alpha);
+        ui.text(&avg_text)
+            .pos(slider_x, center_y - half_height - 0.03)
+            .anchor(0.5, 1.0)
+            .size(0.2 / self.current_chart_ratio)
+            .color(avg_color)
+            .draw();
+        // 绘制历史记录（垂直白条）
+        for &(diff_ms, time) in &bar.history {
+            // 计算透明度（基于剩余时间）
+            let elapsed = tm.now() - time;
+            let progress = ((elapsed / bar.history_duration) as f32).min(1.0);
+            let alpha = 1.0 - progress;
+
+            if alpha <= 0.01 {
+                continue;
+            }
+            // 计算位置
+            let history_offset = (diff_ms / bar.max_ms).clamp(-1.0, 1.0) * half_width;
+            let history_x = center_x + history_offset;
+            // 绘制垂直白条
+            let history_color = Color::new(1.0, 1.0, 1.0, alpha * 0.8 * self.res.alpha);
+            let history_height = half_height * 2.0 * (1.0 - progress * 0.5); // 随时间缩小
+            ui.fill_rect(Rect::new(history_x - 0.003, center_y - history_height / 2.0, 0.006, history_height), history_color);
+        }
+    }
 
     pub async fn new(
+        mode: GameMode,
+        info: ChartInfo,
+        config: Config,
+        fs: Box<dyn FileSystem>,
+        player: Option<BasicPlayer>,
+        background: SafeTexture,
+        illustration: SafeTexture,
+        upload_fn: Option<UploadFn>,
+        update_fn: Option<UpdateFn>,
+    ) -> Result<Self> {
+        let scene_background = Rc::new(RefCell::new(SceneBackground::new(&config)?));
+        Self::new_with_background(mode, info, config, fs, player, background, illustration, upload_fn, update_fn, scene_background).await
+    }
+
+    pub(crate) async fn new_with_background(
         mode: GameMode,
         info: ChartInfo,
         mut config: Config,
@@ -628,6 +628,7 @@ impl GameScene {
         illustration: SafeTexture,
         upload_fn: Option<UploadFn>,
         update_fn: Option<UpdateFn>,
+        scene_background: SharedSceneBackground,
     ) -> Result<Self> {
         match mode {
             GameMode::TweakOffset => {
@@ -653,7 +654,9 @@ impl GameScene {
         let info_offset = info.offset;
         let rhythm_enabled = config.interactive && config.rhythm_analysis;
         let rhythm_cover = if rhythm_enabled {
-            fs.load_file(&info.illustration).await.ok()
+            fs.load_file(&info.illustration)
+                .await
+                .ok()
                 .and_then(|bytes| image::load_from_memory(&bytes).ok())
                 .map(|image| image.into_rgba8())
         } else {
@@ -670,28 +673,34 @@ impl GameScene {
             chart.extra.effects.is_empty() && effects.is_empty(),
             chart.has_block_areas(),
         )
-            .await
-            .context("Failed to load resources")?;
+        .await
+        .context("Failed to load resources")?;
         let exercise_range = (chart.offset + info_offset + res.config.offset)..res.track_length;
+        let preview_span = super::LoadingScene::TOTAL_TIME as f64
+            + (Self::BEFORE_TIME + res.track_length - chart.offset.min(0.)) as f64 / config.speed.max(0.1) as f64;
+        scene_background.borrow_mut().set_preview_span(preview_span);
 
         let judge = Judge::new(&chart);
 
         let music = Self::new_music(&mut res)?;
         let rhythm_strip = if rhythm_enabled {
-            Some(RhythmStrip::from_chart_with_audio(
-                &chart,
-                RhythmNoteSelection::from(&res.config),
-                rhythm_cover.as_ref(),
-                &res.music,
-                res.config.rhythm_auto_bpm,
-                chart.offset + res.config.offset + info_offset,
-            ).with_speed(res.config.rhythm_speed).with_colors(res.config.rhythm_colors.as_ref()))
+            Some(
+                RhythmStrip::from_chart_with_audio(
+                    &chart,
+                    RhythmNoteSelection::from(&res.config),
+                    rhythm_cover.as_ref(),
+                    &res.music,
+                    res.config.rhythm_auto_bpm,
+                    chart.offset + res.config.offset + info_offset,
+                )
+                .with_speed(res.config.rhythm_speed)
+                .with_colors(res.config.rhythm_colors.as_ref()),
+            )
         } else {
             None
         };
         let rhythm_painter = rhythm_strip.as_ref().map(|_| {
-            let font = FontArc::try_from_slice(include_bytes!("../../assets/fonts/Saira-SemiBold.ttf"))
-                .expect("embedded Saira font is valid");
+            let font = FontArc::try_from_slice(include_bytes!("../../assets/fonts/Saira-SemiBold.ttf")).expect("embedded Saira font is valid");
             TextPainter::new(font)
         });
 
@@ -715,6 +724,7 @@ impl GameScene {
             gl: unsafe { get_internal_gl() },
             player,
             effects,
+            scene_background,
             info_offset,
 
             first_in: false,
@@ -725,6 +735,7 @@ impl GameScene {
             music,
             rhythm_strip,
             rhythm_painter,
+            hdr_rhythm_frame: None,
 
             state: State::Starting,
             last_update_time: 0.,
@@ -795,8 +806,8 @@ impl GameScene {
         text_size
     }
 
-
-    fn ui(&mut self, ui: &mut Ui, tm: &mut TimeManager) -> Result<()> {
+    fn ui(&mut self, ui: &mut Ui, tm: &mut TimeManager, layer: Option<&str>) -> Result<()> {
+        let selected = |name| layer.map_or(true, |key| key == name);
         let time = tm.now() as f32;
         let p = match self.state {
             State::Starting => {
@@ -806,7 +817,6 @@ impl GameScene {
                 } else {
                     1.
                 }
-
             }
             State::BeforeMusic => 1.,
             State::Playing => 1.,
@@ -816,12 +826,16 @@ impl GameScene {
             }
         };
         let mut c = Color::new(1., 1., 1., self.res.alpha);
-        if matches!(self.state, State::Starting) { c.a *= p; }
-        if matches!(self.state, State::Ending) { c.a *= -p }
+        if matches!(self.state, State::Starting) {
+            c.a *= p;
+        }
+        if matches!(self.state, State::Ending) {
+            c.a *= -p
+        }
         let res = &mut self.res;
         /// 4：3
         const BASE_ASPECT_RATIO: f32 = 16.0 / 9.0;
-        let is_narrow = res.aspect_ratio < 1.5;  // 1.5 ≈ 3:2，4:3 .1.333
+        let is_narrow = res.aspect_ratio < 1.5; // 1.5 ≈ 3:2，4:3 .1.333
         let is_4_3 = (res.aspect_ratio - 4.0 / 3.0).abs() < 0.01;
 
         let scale_4_3 = if is_4_3 { 1.230 } else { 1.0 };
@@ -834,10 +848,7 @@ impl GameScene {
 
         let pause_w = 0.011 * scale_4_3;
         let pause_h = pause_w * 3.4;
-        let mut pause_center = Point::new(
-            pause_w * 4.4 - 1.,
-            top + eps * 3.6454 - (1. - p) * 0.4 + pause_h / 2.,
-        );
+        let mut pause_center = Point::new(pause_w * 4.4 - 1., top + eps * 3.6454 - (1. - p) * 0.4 + pause_h / 2.);
 
         if is_narrow {
             let narrow_factor1 = (BASE_ASPECT_RATIO - res.aspect_ratio) / (BASE_ASPECT_RATIO - 1.0);
@@ -879,17 +890,17 @@ impl GameScene {
         // combo
         let combo_top = top + eps * 1.346 - (1. - p) * 0.4;
         //按钮作用
-        if res.config.ui_pause {
+        if selected("pause") && res.config.ui_pause {
             if res.config.interactive
                 && !tm.paused()
                 && self.pause_rewind.is_none()
                 && Judge::get_touches().iter().any(|touch| {
-                touch.phase == TouchPhase::Started && {
-                    let p = touch.position;
-                    let p = Point::new(p.x, p.y);
-                    (pause_center - p).norm() < 0.05 * scale_4_3
-                }
-            })
+                    touch.phase == TouchPhase::Started && {
+                        let p = touch.position;
+                        let p = Point::new(p.x, p.y);
+                        (pause_center - p).norm() < 0.05 * scale_4_3
+                    }
+                })
             {
                 let t = tm.now() as f32;
                 if t - self.pause_first_time > PAUSE_CLICK_INTERVAL && res.config.double_click_to_pause {
@@ -903,32 +914,39 @@ impl GameScene {
                 }
             }
         }
-        if tm.now() as f32 - self.pause_first_time <= PAUSE_CLICK_INTERVAL {
+        if selected("pause") && tm.now() as f32 - self.pause_first_time <= PAUSE_CLICK_INTERVAL {
             ui.fill_circle(pause_center.x, pause_center.y, 0.05 * scale_4_3, Color::new(1., 1., 1., 0.5));
         }
 
         let ct = ui.text(&score).size(0.8).center();
         // 分数
-        if res.config.ui_score {
-            self.chart.with_element(ui, res, UIElement::Score, Some((-ct.x + 1. - margin, ct.y + score_top)), Some((1. - margin + 0.001, adjusted_score_y)), |ui, color| {
-                let mut text_size = 0.70867 * scale_4_3;
-                let mut text = ui.text(&score).size(text_size);
-                let max_width = 0.55;
-                let text_width = text.measure().w;
-                if text_width > max_width {
-                    text_size *= max_width / text_width
-                }
-                drop(text);
-                ui.text(format!("{:07}", self.display_score))
-                    .pos(1. - margin + 0.001, adjusted_score_y)
-                    .anchor(1., 0.)
-                    .size(text_size)
-                    .color(Color { a: color.a * c.a, ..color })
-                    .draw();
-            });
+        if selected(if res.config.score_aim { "scoreAim" } else { "score" }) && res.config.ui_score {
+            self.chart.with_element(
+                ui,
+                res,
+                UIElement::Score,
+                Some((-ct.x + 1. - margin, ct.y + score_top)),
+                Some((1. - margin + 0.001, adjusted_score_y)),
+                |ui, color| {
+                    let mut text_size = 0.70867 * scale_4_3;
+                    let mut text = ui.text(&score).size(text_size);
+                    let max_width = 0.55;
+                    let text_width = text.measure().w;
+                    if text_width > max_width {
+                        text_size *= max_width / text_width
+                    }
+                    drop(text);
+                    ui.text(format!("{:07}", self.display_score))
+                        .pos(1. - margin + 0.001, adjusted_score_y)
+                        .anchor(1., 0.)
+                        .size(text_size)
+                        .color(Color { a: color.a * c.a, ..color })
+                        .draw();
+                },
+            );
         }
 
-        if res.config.show_acc {
+        if selected("score") && res.config.show_acc {
             let mut acc_size = 0.4 * scale_4_3;
 
             ui.text(format!("{:05.2}%", self.judge.real_time_accuracy() * 100.))
@@ -939,94 +957,130 @@ impl GameScene {
                 .draw();
         }
 
-        if res.config.ui_pause {
-            self.chart.with_element(ui, res, UIElement::Pause, Some((pause_center.x, pause_center.y)), Some((pause_center.x - pause_w * 1.2, pause_center.y - pause_h / 2.2)), |ui, color| {
-                let mut r = Rect::new(pause_center.x - pause_w * 1.2, pause_center.y - pause_h / 2.2, pause_w, pause_h);
-                let c = Color { a: color.a * c.a, ..color };
-                ui.fill_rect(r, c);
-                r.x += pause_w * 2.;
-                ui.fill_rect(r, c);
-            });
+        if selected("pause") && res.config.ui_pause {
+            self.chart.with_element(
+                ui,
+                res,
+                UIElement::Pause,
+                Some((pause_center.x, pause_center.y)),
+                Some((pause_center.x - pause_w * 1.2, pause_center.y - pause_h / 2.2)),
+                |ui, color| {
+                    let mut r = Rect::new(pause_center.x - pause_w * 1.2, pause_center.y - pause_h / 2.2, pause_w, pause_h);
+                    let c = Color { a: color.a * c.a, ..color };
+                    ui.fill_rect(r, c);
+                    r.x += pause_w * 2.;
+                    ui.fill_rect(r, c);
+                },
+            );
         }
 
         let unit_h = ui.text("0").measure().h;
-        if res.config.ui_combo {
+        if selected("combo") && res.config.ui_combo {
             if self.judge.combo() >= 3 {
                 let pluse_scale = if self.combo_pluse_anim > 0.0 {
                     1.0 + 0.3 * (self.combo_pluse_anim / self.combo_pluse_duration).sin()
                 } else {
                     1.0
                 };
-                let btm = self.chart.with_element(ui, res, UIElement::ComboNumber, Some((0., combo_top + unit_h / 2.)), Some((0., combo_top + unit_h / 2.)), |ui, color| {
-                    let mut text_size = 0.98 * combo_text_1 * pluse_scale;
-                    let max_width = 0.55;
-                    let mut text = ui.text(&res.config.combo)
-                        .pos(0., combo_top)
-                        .anchor(0.5, 0.)
-                        .color(Color::new(0., 0., 0., 0.));
-                    let text_width = text.measure().w;
-                    let text_btm = text.draw().bottom();
-                    if text_width > max_width {
-                        text_size *= max_width / text_width
-                    }
-                    ui.text(self.judge.combo().to_string())
-                        .pos(0., combo_top)
-                        .anchor(0.5, 0.)
-                        .color(Color { a: color.a * c.a, ..color })
-                        .size(text_size)
-                        .draw();
-                    text_btm
-                });
-                self.chart.with_element(ui, res, UIElement::Combo, Some((0., btm + 0.007777 + unit_h * 0.325 / 2.)), Some((0., btm + 0.007777 + unit_h * 0.325 / 2.)), |ui, color| {
-                    let mut combo_text_size = 0.325 * scale_4_3;
+                let btm = self.chart.with_element(
+                    ui,
+                    res,
+                    UIElement::ComboNumber,
+                    Some((0., combo_top + unit_h / 2.)),
+                    Some((0., combo_top + unit_h / 2.)),
+                    |ui, color| {
+                        let mut text_size = 0.98 * combo_text_1 * pluse_scale;
+                        let max_width = 0.55;
+                        let mut text = ui
+                            .text(&res.config.combo)
+                            .pos(0., combo_top)
+                            .anchor(0.5, 0.)
+                            .color(Color::new(0., 0., 0., 0.));
+                        let text_width = text.measure().w;
+                        let text_btm = text.draw().bottom();
+                        if text_width > max_width {
+                            text_size *= max_width / text_width
+                        }
+                        ui.text(self.judge.combo().to_string())
+                            .pos(0., combo_top)
+                            .anchor(0.5, 0.)
+                            .color(Color { a: color.a * c.a, ..color })
+                            .size(text_size)
+                            .draw();
+                        text_btm
+                    },
+                );
+                self.chart.with_element(
+                    ui,
+                    res,
+                    UIElement::Combo,
+                    Some((0., btm + 0.007777 + unit_h * 0.325 / 2.)),
+                    Some((0., btm + 0.007777 + unit_h * 0.325 / 2.)),
+                    |ui, color| {
+                        let mut combo_text_size = 0.325 * scale_4_3;
 
-                    ui.text(&res.config.combo)
-                        .pos(0., btm + 0.007777 + combo_offset_4_3)
-                        .anchor(0.5, 0.)
-                        .size(combo_text_size)
-                        .color(Color { a: color.a * c.a, ..color })
-                        .draw();
-                });
+                        ui.text(&res.config.combo)
+                            .pos(0., btm + 0.007777 + combo_offset_4_3)
+                            .anchor(0.5, 0.)
+                            .size(combo_text_size)
+                            .color(Color { a: color.a * c.a, ..color })
+                            .draw();
+                    },
+                );
             }
         }
 
         //名字
-        if res.config.ui_name {
-            self.chart.with_element(ui, res, UIElement::Name, Some((lf + ct.x, bt - ct.y)), Some((-1. + margin * 0.7, -top - eps * 2.)), |ui, color| {
-                let mut text_size = 0.5 * scale_4_3;
+        if selected("name") && res.config.ui_name {
+            self.chart.with_element(
+                ui,
+                res,
+                UIElement::Name,
+                Some((lf + ct.x, bt - ct.y)),
+                Some((-1. + margin * 0.7, -top - eps * 2.)),
+                |ui, color| {
+                    let mut text_size = 0.5 * scale_4_3;
 
-                let mut text = ui.text(&res.info.name).size(text_size);
-                let max_width = 0.9;
-                let text_width = text.measure().w;
-                if text_width > max_width {
-                    text_size *= max_width / text_width
-                }
-                drop(text);
-                ui.text(&res.info.name)
-                    .pos(lf, bt + (1. - p) * 0.4)
-                    .anchor(0., 1.)
-                    .size(text_size)
-                    .color(Color { a: color.a * c.a, ..color })
-                    .draw();
-            });
+                    let mut text = ui.text(&res.info.name).size(text_size);
+                    let max_width = 0.9;
+                    let text_width = text.measure().w;
+                    if text_width > max_width {
+                        text_size *= max_width / text_width
+                    }
+                    drop(text);
+                    ui.text(&res.info.name)
+                        .pos(lf, bt + (1. - p) * 0.4)
+                        .anchor(0., 1.)
+                        .size(text_size)
+                        .color(Color { a: color.a * c.a, ..color })
+                        .draw();
+                },
+            );
         }
 
         //等级
-        if res.config.ui_level {
-            self.chart.with_element(ui, res, UIElement::Level, Some((-lf - ct.x, bt - ct.y)), Some((1. - margin * 0.7, -top - eps * 2.)), |ui, color| {
-                let mut level_text_size = 0.5 * scale_4_3;
+        if selected("level") && res.config.ui_level {
+            self.chart.with_element(
+                ui,
+                res,
+                UIElement::Level,
+                Some((-lf - ct.x, bt - ct.y)),
+                Some((1. - margin * 0.7, -top - eps * 2.)),
+                |ui, color| {
+                    let mut level_text_size = 0.5 * scale_4_3;
 
-                ui.text(&res.info.level)
-                    .pos(-lf, bt + (1. - p) * 0.4)
-                    .anchor(1., 1.)
-                    .size(level_text_size)
-                    .color(Color { a: color.a * c.a, ..color })
-                    .draw();
-            });
+                    ui.text(&res.info.level)
+                        .pos(-lf, bt + (1. - p) * 0.4)
+                        .anchor(1., 1.)
+                        .size(level_text_size)
+                        .color(Color { a: color.a * c.a, ..color })
+                        .draw();
+                },
+            );
         }
 
         //水印
-        {
+        if selected("watermark") {
             let watermark = res.config.watermark.clone();
             let mut watermark_size = 0.25 * scale_4_3;
 
@@ -1066,45 +1120,50 @@ impl GameScene {
             bar_y = top - progress * height * 2.5;
         }
         //进度条
-        if res.config.ui_pb {
-            self.chart.with_element(ui, res, UIElement::Bar, Some((-1., top + height / 2.)), Some((-1., top + height / 2.)), |ui, color| {
-                ui.fill_rect(
-                    Rect::new(-1., bar_y, dest, height),
-                    Color::new(0.565, 0.565, 0.565, color.a * c.a * bar_alpha),
-                );
-                ui.fill_rect(Rect::new(-1. + dest - hw, bar_y, hw * 2., height), Color::new(1., 1., 1., color.a * c.a * bar_alpha));
+        if selected("pb") && res.config.ui_pb {
+            self.chart
+                .with_element(ui, res, UIElement::Bar, Some((-1., top + height / 2.)), Some((-1., top + height / 2.)), |ui, color| {
+                    ui.fill_rect(Rect::new(-1., bar_y, dest, height), Color::new(0.565, 0.565, 0.565, color.a * c.a * bar_alpha));
+                    ui.fill_rect(Rect::new(-1. + dest - hw, bar_y, hw * 2., height), Color::new(1., 1., 1., color.a * c.a * bar_alpha));
+                });
+        }
+        if selected("progressText") || selected("timeText") {
+        self.chart
+            .with_element(ui, res, UIElement::Bar, Some((-1., top + height / 2.)), Some((-1., top + height / 2.)), |ui, color| {
+                let progress = res.time / res.track_length;
+                let corrected_progress = if progress >= 0.9999 { 1.0 } else { progress };
+                let progress_percentage = (corrected_progress * 100.).min(100.);
+                let truncated_percentage = ((progress_percentage * 10000.0).floor() / 10000.0).min(100.0);
+                let progress_text = format!("{:.4}%", truncated_percentage);
+                let parts: Vec<&str> = progress_text.split('.').collect();
+                let current_time_text = fmt_time(res.time);
+                let total_time_text = fmt_time(res.track_length);
+                let time_text = format!("{}", current_time_text);
+
+                if selected("progressText") && res.config.show_progress_text {
+                    ui.text(progress_text)
+                        .pos(1. - margin, top + eps * 2.2 - (1. - p) * 0.4 + 0.07 + 0.01)
+                        .anchor(1., 0.)
+                        .size(0.4)
+                        .color(semi_white(0.7))
+                        .draw();
+                }
+                if selected("timeText") && res.config.show_time_text {
+                    ui.text(time_text)
+                        .pos(-1. + dest - 0.01, top + height / 2. - 0.0008)
+                        .anchor(1., 0.5)
+                        .size(0.17867)
+                        .color(Color::new(1.0, 1.0, 1.0, color.a * c.a))
+                        .draw();
+                }
             });
         }
-        self.chart.with_element(ui, res, UIElement::Bar, Some((-1., top + height / 2.)), Some((-1., top + height / 2.)), |ui, color| {
-            let progress = res.time / res.track_length;
-            let corrected_progress = if progress >= 0.9999 { 1.0 } else { progress };
-            let progress_percentage = (corrected_progress * 100.).min(100.);
-            let truncated_percentage = ((progress_percentage * 10000.0).floor() / 10000.0).min(100.0);
-            let progress_text = format!("{:.4}%", truncated_percentage);
-            let parts: Vec<&str> = progress_text.split('.').collect();
-            let current_time_text = fmt_time(res.time);
-            let total_time_text = fmt_time(res.track_length);
-            let time_text = format!("{}", current_time_text);
-
-            if res.config.show_progress_text {
-                ui.text(progress_text)
-                    .pos(1. - margin, top + eps * 2.2 - (1. - p) * 0.4 + 0.07 + 0.01)
-                    .anchor(1., 0.)
-                    .size(0.4)
-                    .color(semi_white(0.7))
-                    .draw();
-            }
-            if res.config.show_time_text {
-                ui.text(time_text)
-                    .pos(-1. + dest - 0.01, top + height / 2. - 0.0008)
-                    .anchor(1., 0.5)
-                    .size(0.17867)
-                    .color(Color::new(1.0, 1.0, 1.0, color.a * c.a))
-                    .draw();
-            }
-        });
-        self.draw_judgement_counters(ui, tm, score_top, 2.3);
-        GameScene::draw_judgement_bar(self, ui, tm);
+        if selected("line") {
+            self.draw_judgement_counters(ui, tm, score_top, 2.3);
+        }
+        if selected("bar") {
+            GameScene::draw_judgement_bar(self, ui, tm);
+        }
         Ok(())
     }
 
@@ -1375,19 +1434,11 @@ impl GameScene {
             judgements.clear();
             return;
         }
-        let note_types = [
-            NoteType::Click,
-            NoteType::Drag,
-            NoteType::Flick,
-            NoteType::Hold,
-        ];
+        let note_types = [NoteType::Click, NoteType::Drag, NoteType::Flick, NoteType::Hold];
         for note_type in note_types {
             if !self.judgement_counters.iter().any(|c| c.note_type == note_type) {
-                self.judgement_counters.push(JudgementCounter::new(
-                    note_type,
-                    self.res.config.chart_ratio,
-                    0.0,
-                ));
+                self.judgement_counters
+                    .push(JudgementCounter::new(note_type, self.res.config.chart_ratio, 0.0));
             }
         }
 
@@ -1409,18 +1460,11 @@ impl GameScene {
                         _ => continue,
                     };
 
-                    if let Some(counter) = self.judgement_counters
-                        .iter_mut()
-                        .find(|c| c.note_type == note_type)
-                    {
+                    if let Some(counter) = self.judgement_counters.iter_mut().find(|c| c.note_type == note_type) {
                         let current_time = t as f64;
                         let is_same_time = (current_time - counter.last_update).abs() <= f64::EPSILON * 2.0;
 
-                        let effective_interval = if is_same_time {
-                            0.0
-                        } else {
-                            current_time - counter.last_update
-                        };
+                        let effective_interval = if is_same_time { 0.0 } else { current_time - counter.last_update };
 
                         let old_count = counter.count;
                         let old_multiplier = counter.multiplier;
@@ -1501,14 +1545,18 @@ impl GameScene {
             ui.slider(tl!("speed"), 0.1..2.0, 0.05, &mut self.res.config.speed, Some(0.3));
             if ui.button("save-speed", Rect::new(0.44, 0.033, 0.05, 0.05), "=") && (tm.speed - self.res.config.speed as f64).abs() > 0.01 {
                 debug!("recreating music");
-                self.music = self.res.audio.create_music(
-                    self.res.music.clone(),
-                    MusicParams {
-                        amplifier: self.res.config.volume_music as _,
-                        playback_rate: self.res.config.speed as _,
-                        ..Default::default()
-                    },
-                ).expect("failed to create music");
+                self.music = self
+                    .res
+                    .audio
+                    .create_music(
+                        self.res.music.clone(),
+                        MusicParams {
+                            amplifier: self.res.config.volume_music as _,
+                            playback_rate: self.res.config.speed as _,
+                            ..Default::default()
+                        },
+                    )
+                    .expect("failed to create music");
                 reset_speed!(self, self.res, tm);
             }
         });
@@ -1576,9 +1624,7 @@ impl Scene for GameScene {
         }
         if combo_anim {
             if self.combo_pluse_anim > 0.0 {
-                self.combo_pluse_anim = (
-                    self.combo_pluse_anim - delta_time / self.combo_pluse_duration.max(0.0)
-                );
+                self.combo_pluse_anim = (self.combo_pluse_anim - delta_time / self.combo_pluse_duration.max(0.0));
             }
         }
         let current_combo = self.judge.combo();
@@ -1691,10 +1737,7 @@ impl Scene for GameScene {
                     let mut record_data = None;
                     #[cfg(feature = "closed")]
                     if let Some(upload_fn) = &self.upload_fn {
-                        if !self.res.config.offline_mode
-                            && !self.res.config.autoplay()
-                            && self.res.config.speed >= 1.0 - 1e-3
-                        {
+                        if !self.res.config.offline_mode && !self.res.config.autoplay() && self.res.config.speed >= 1.0 - 1e-3 {
                             if let Some(player) = &self.player {
                                 if let Some(chart) = &self.res.info.id {
                                     record_data = Some(encode_record(self, player.id, *chart));
@@ -1713,23 +1756,26 @@ impl Scene for GameScene {
                         })
                     };
                     self.next_scene = match self.mode {
-                        GameMode::Normal | GameMode::NoRetry | GameMode::View => Some(NextScene::Overlay(Box::new(EndingScene::new(
-                            self.res.background.clone(),
-                            self.res.illustration.clone(),
-                            self.res.player.clone(),
-                            self.res.icons.clone(),
-                            self.res.icon_retry.clone(),
-                            self.res.icon_proceed.clone(),
-                            self.res.info.clone(),
-                            self.judge.result(),
-                            self.res.challenge_icons[self.res.config.challenge_color.clone() as usize].clone(),
-                            &self.res.config,
-                            self.res.res_pack.ending.clone(),
-                            self.upload_fn.as_ref().map(Arc::clone),
-                            self.player.as_ref().map(|it| it.rks),
-                            record_data,
-                            record,
-                        )?))),
+                        GameMode::Normal | GameMode::NoRetry | GameMode::View => {
+                            Some(NextScene::Overlay(Box::new(EndingScene::new_with_background(
+                                self.res.background.clone(),
+                                self.res.illustration.clone(),
+                                self.res.player.clone(),
+                                self.res.icons.clone(),
+                                self.res.icon_retry.clone(),
+                                self.res.icon_proceed.clone(),
+                                self.res.info.clone(),
+                                self.judge.result(),
+                                self.res.challenge_icons[self.res.config.challenge_color.clone() as usize].clone(),
+                                &self.res.config,
+                                self.res.res_pack.ending.clone(),
+                                self.upload_fn.as_ref().map(Arc::clone),
+                                self.player.as_ref().map(|it| it.rks),
+                                record_data,
+                                record,
+                                Rc::clone(&self.scene_background),
+                            )?)))
+                        }
                         GameMode::TweakOffset => Some(NextScene::PopWithResult(Box::new(None::<f32>))),
                         GameMode::Exercise => None,
                     };
@@ -1742,7 +1788,8 @@ impl Scene for GameScene {
         self.res.time = time;
         if !tm.paused() && self.pause_rewind.is_none() && self.mode != GameMode::View {
             self.gl.quad_gl.viewport(self.res.camera.viewport);
-            self.judge.update(&mut self.res, &mut self.chart, &mut self.bad_notes, self.is_fast_forwarding);
+            self.judge
+                .update(&mut self.res, &mut self.chart, &mut self.bad_notes, self.is_fast_forwarding);
             self.gl.quad_gl.viewport(None);
         }
         self.actual_score = self.judge.score();
@@ -1876,12 +1923,7 @@ impl Scene for GameScene {
         Ok(())
     }
 
-    fn render(
-        &mut self,
-        tm: &mut TimeManager,
-        ui: &mut Ui,
-        target: Option<RenderTarget>,
-    ) -> Result<()> {
+    fn render(&mut self, tm: &mut TimeManager, ui: &mut Ui, target: Option<RenderTarget>) -> Result<()> {
         self.res.camera.render_target = target;
         // 噪域 normally sits above the chart but below the HUD. `blockAreaUi`
         // flips the last two layers, drawing the HUD on the screen after the
@@ -1904,20 +1946,15 @@ impl Scene for GameScene {
             target.begin_frame();
         }
 
+        if let Some(target) = res.hdr_line_target.as_mut() {
+            target.begin_frame();
+        }
+
         let chart_onto = res
             .chart_target
             .as_ref()
             .map(|it| if msaa { it.input() } else { it.output() })
             .or(res.camera.render_target);
-        set_camera(&Camera2D {
-            zoom: vec2(1., -asp),
-            viewport: if res.chart_target.is_some() { None } else { Some(ui.viewport) },
-            render_target: chart_onto,
-            ..Default::default()
-        });
-        clear_background(BLACK);
-        draw_background(*res.background);
-
         let chart_target_vp = if res.chart_target.is_some() {
             let vp = res.camera.viewport.unwrap();
             Some((vp.0 - ui.viewport.0, vp.1 - ui.viewport.1, vp.2, vp.3))
@@ -1926,30 +1963,65 @@ impl Scene for GameScene {
         };
         let chart_ratio = self.current_chart_ratio;
         let h = 1. / res.aspect_ratio;
-        if chart_ratio >= 1.0 {
-            let dim_alpha = 0.7;
-            let dim = Color::new(0.1, 0.1, 0.1, dim_alpha * res.alpha);
-            let x_range = vp.0 as f32 / ui.viewport.2 as f32;
+        let dim_background = |opaque_background, render_target| {
+            if chart_ratio >= 1.0 && opaque_background {
+                let dim_alpha = 0.7;
+                let dim = Color::new(0.1, 0.1, 0.1, dim_alpha * res.alpha);
+                let x_range = vp.0 as f32 / ui.viewport.2 as f32;
 
-            draw_rectangle(-1., -h, x_range * 2., h * 2., dim);
-            draw_rectangle(1., -h, -x_range * 2., h * 2., dim);
-            draw_rectangle(
-                x_range * 2. - 1.,
-                -h,
-                (1. - x_range * 2.) * 2.,
-                h * 2.,
-                Color::new(0., 0., 0., res.alpha * res.info.background_dim),
-            );
+                draw_rectangle(-1., -h, x_range * 2., h * 2., dim);
+                draw_rectangle(1., -h, -x_range * 2., h * 2., dim);
+                draw_rectangle(x_range * 2. - 1., -h, (1. - x_range * 2.) * 2., h * 2., Color::new(0., 0., 0., res.alpha * res.info.background_dim));
+            }
+
+            set_camera(&Camera2D {
+                zoom: vec2_asp,
+                viewport: chart_target_vp,
+                render_target,
+                ..Default::default()
+            });
+            if opaque_background {
+                draw_rectangle(-1., -h, 2., h * 2., Color::new(0., 0., 0., res.alpha * res.info.background_dim));
+            }
+        };
+        if res.config.hdr_output {
+            let background_target = res.background_target.as_mut().expect("HDR background target");
+            background_target.begin_frame();
+            let background_pass = background_target.input();
+            set_camera(&Camera2D {
+                zoom: vec2(1., -asp),
+                viewport: None,
+                render_target: Some(background_pass),
+                ..Default::default()
+            });
+            let opaque = self.scene_background.borrow_mut().draw(*res.background, asp, tm.unscaled_time())?;
+            dim_background(opaque, Some(background_pass));
+            background_target.map_hdr(&res.config.hdr_settings.background);
+
+            set_camera(&Camera2D {
+                zoom: vec2(1., -asp),
+                viewport: None,
+                render_target: chart_onto,
+                ..Default::default()
+            });
+            clear_background(BLANK);
+        } else {
+            set_camera(&Camera2D {
+                zoom: vec2(1., -asp),
+                viewport: if res.chart_target.is_some() { None } else { Some(ui.viewport) },
+                render_target: chart_onto,
+                ..Default::default()
+            });
+            let opaque = self.scene_background.borrow_mut().draw(*res.background, asp, tm.unscaled_time())?;
+            dim_background(opaque, chart_onto);
         }
 
         set_camera(&Camera2D {
             zoom: vec2_asp,
             viewport: chart_target_vp,
+            render_target: chart_onto,
             ..Default::default()
         });
-
-        self.gl.quad_gl.render_pass(chart_onto.map(|it| it.render_pass));
-        draw_rectangle(-1., -h, 2., h * 2., Color::new(0., 0., 0., res.alpha * res.info.background_dim));
         res.chart_ratio_inv = 1.0 / self.current_chart_ratio;
         self.chart.render(ui, res);
 
@@ -1971,13 +2043,13 @@ impl Scene for GameScene {
         let dt = (t - std::mem::replace(&mut self.last_update_time, t)) as f32;
         // With 噪域 present these layers are replayed after the block-area pass
         // (see below) so hit effects stay above it.
-        if !has_block_effect && res.config.particle {
+        if (!has_block_effect || res.config.hdr_output) && res.config.particle {
             res.emitter.draw(dt);
         }
         drop(res);
         let res = &mut self.res;
         // 特效zoom
-        if !has_block_effect && !res.no_effect {
+        if (!has_block_effect || res.config.hdr_output) && !res.no_effect {
             // Single flush before all effects (replaces per-effect flush)
             self.gl.flush();
             set_camera(&Camera2D {
@@ -1991,17 +2063,17 @@ impl Scene for GameScene {
             }
         }
 
-        if !ui_above_block {
+        if !ui_above_block && !self.res.config.hdr_output {
             set_camera(&Camera2D {
                 zoom: vec2_asp,
                 viewport: chart_target_vp,
                 render_target: self.res.chart_target.as_ref().map(|it| it.output()).or(self.res.camera.render_target),
                 ..Default::default()
             });
-            self.ui(ui, tm)?;
+            self.ui(ui, tm, None)?;
         }
 
-        if !has_block_effect && !self.res.no_effect && !self.effects.is_empty() {
+        if (!has_block_effect || self.res.config.hdr_output) && !self.res.no_effect && !self.effects.is_empty() {
             // Single flush before global effects
             self.gl.flush();
             set_camera(&Camera2D {
@@ -2013,7 +2085,7 @@ impl Scene for GameScene {
             }
         }
 
-        if !ui_above_block {
+        if !ui_above_block && !self.res.config.hdr_output {
             set_camera(&Camera2D {
                 zoom: vec2(1., -asp2),
                 viewport: chart_target_vp,
@@ -2023,7 +2095,7 @@ impl Scene for GameScene {
             self.overlay_ui(ui, tm)?;
         }
 
-        if self.mode == GameMode::TweakOffset {
+        if self.mode == GameMode::TweakOffset && !self.res.config.hdr_output {
             //push_camera_state();
             self.gl.quad_gl.viewport(None);
             set_camera(&Camera2D {
@@ -2033,6 +2105,78 @@ impl Scene for GameScene {
             });
             self.tweak_offset(ui, Self::interactive(&self.res, &self.state), tm);
             //pop_camera_state();
+        }
+
+        let mut hdr_scene_texture = None;
+        if self.res.config.hdr_output {
+            let chart_target = self.res.chart_target.as_mut().expect("HDR chart target");
+            chart_target.map_hdr(&self.res.config.hdr_settings.note);
+            let note_texture = chart_target.output().texture;
+            let line_settings = self.res.config.hdr_settings.ui.get("line").cloned().unwrap_or_default();
+            let line_target = self.res.hdr_line_target.as_mut().expect("HDR line target");
+            line_target.map_hdr(&line_settings);
+            let line_texture = line_target.output().texture;
+            let background_texture = self.res.background_target.as_ref().expect("HDR background target").output().texture;
+            let scene_target = self.res.hdr_scene_target.as_mut().expect("HDR scene target");
+            scene_target.begin_frame();
+            set_camera(&Camera2D { zoom: vec2(1., asp), render_target: Some(scene_target.input()), ..Default::default() });
+            clear_background(BLANK);
+            draw_texture_ex(background_texture, -1., -ui.top, WHITE, DrawTextureParams { dest_size: Some(vec2(2., ui.top * 2.)), ..Default::default() });
+            draw_texture_ex(line_texture, -1., -ui.top, WHITE, DrawTextureParams { dest_size: Some(vec2(2., ui.top * 2.)), ..Default::default() });
+            draw_texture_ex(note_texture, -1., -ui.top, WHITE, DrawTextureParams { dest_size: Some(vec2(2., ui.top * 2.)), ..Default::default() });
+            let scene_texture = scene_target.output().texture;
+
+            if has_block_effect {
+                let zones = self.chart.block_effect_zones(&self.res);
+                let block_settings = self.res.config.hdr_settings.block_area.clone();
+                let block_target = self.res.hdr_block_target.as_mut().expect("HDR block-area target");
+                block_target.begin_frame();
+                set_camera(&Camera2D { zoom: vec2(1., asp), render_target: Some(block_target.input()), ..Default::default() });
+                clear_background(BLANK);
+                crate::core::draw_block_effect(
+                    &zones,
+                    self.res.aspect_ratio,
+                    (scene_texture.width() as i32, scene_texture.height() as i32, scene_texture.width() as i32, scene_texture.height() as i32),
+                    scene_texture,
+                    tm.now() as f32,
+                    (-1., -ui.top, 2., ui.top * 2.),
+                );
+                block_target.map_hdr_linear_bt2020(&block_settings);
+                let procedural_texture = block_target.output().texture;
+                self.gl.flush();
+                set_camera(&Camera2D {
+                    zoom: vec2(1., asp),
+                    render_target: target,
+                    viewport: Some(ui.viewport),
+                    ..Default::default()
+                });
+                clear_background(BLANK);
+                let params = DrawTextureParams { dest_size: Some(vec2(2., ui.top * 2.)), ..Default::default() };
+                draw_texture_ex(scene_texture, -1., -ui.top, WHITE, params.clone());
+                draw_texture_ex(procedural_texture, -1., -ui.top, WHITE, params.clone());
+
+                let time = self.res.time as f64;
+                if self.chart.has_visible_rpe_block_effect(time) {
+                    set_camera(&Camera2D {
+                        zoom: vec2(1., asp),
+                        render_target: Some(block_target.input()),
+                        ..Default::default()
+                    });
+                    clear_background(BLANK);
+                    draw_texture_ex(scene_texture, -1., -ui.top, WHITE, params.clone());
+                    self.chart.draw_rpe_block_effect(scene_texture, time, self.res.aspect_ratio, (-1., -ui.top, 2., ui.top * 2.));
+                    block_target.map_hdr_changed_pixels(&block_settings, scene_texture);
+                    set_camera(&Camera2D {
+                        zoom: vec2(1., asp),
+                        render_target: target,
+                        viewport: Some(ui.viewport),
+                        ..Default::default()
+                    });
+                    draw_texture_ex(block_target.output().texture, -1., -ui.top, WHITE, params);
+                }
+            } else {
+                hdr_scene_texture = Some(scene_texture);
+            }
         }
 
         // Block areas need the resolved scene even with MSAA=1 and ordinary
@@ -2048,21 +2192,27 @@ impl Scene for GameScene {
                     ..Default::default()
                 });
 
-                draw_texture_ex(
-                    target.output().texture,
-                    -1.,
-                    -ui.top,
-                    WHITE,
-                    DrawTextureParams {
-                        dest_size: Some(vec2(2., ui.top * 2.)),
-                        ..Default::default()
-                    },
-                );
+                if !has_block_effect || !self.res.config.hdr_output {
+                    if self.res.config.transparent_background || self.res.config.hdr_output {
+                        clear_background(BLANK);
+                    }
+                    let source_texture = hdr_scene_texture.unwrap_or(target.output().texture);
+                    draw_texture_ex(
+                        source_texture,
+                        -1.,
+                        -ui.top,
+                        WHITE,
+                        DrawTextureParams {
+                            dest_size: Some(vec2(2., ui.top * 2.)),
+                            ..Default::default()
+                        },
+                    );
+                }
 
                 // 噪域 (`blockAreaList`) runs as a post pass over the resolved
                 // chart target: the shader samples that texture for refraction,
                 // so it has to be drawn after the blit above.
-                if has_block_effect {
+                if has_block_effect && !self.res.config.hdr_output {
                     let zones = self.chart.block_effect_zones(&self.res);
                     let texture = target.output().texture;
                     crate::core::draw_block_effect(
@@ -2073,10 +2223,11 @@ impl Scene for GameScene {
                         tm.now() as f32,
                         (-1., -ui.top, 2., ui.top * 2.),
                     );
-                    self.chart.draw_rpe_block_effect(texture, self.res.time as f64, self.res.aspect_ratio, (-1., -ui.top, 2., ui.top * 2.));
+                    self.chart
+                        .draw_rpe_block_effect(texture, self.res.time as f64, self.res.aspect_ratio, (-1., -ui.top, 2., ui.top * 2.));
                 }
             }
-            if has_block_effect {
+            if has_block_effect && !self.res.config.hdr_output {
                 // Replay the layers that must sit above 噪域, then the HUD.
                 // Chart-space content uses the same flipped camera as the chart
                 // target; the blit flips, so the screen equivalent keeps the
@@ -2109,14 +2260,14 @@ impl Scene for GameScene {
                         }
                     }
                 }
-                if ui_above_block {
+                if ui_above_block && !self.res.config.hdr_output {
                     set_camera(&Camera2D {
                         zoom: vec2(chart_ratio, -asp),
                         viewport: Some(ui.viewport),
                         render_target: self.res.camera.render_target,
                         ..Default::default()
                     });
-                    self.ui(ui, tm)?;
+                    self.ui(ui, tm, None)?;
                     set_camera(&Camera2D {
                         zoom: vec2(1., -asp),
                         viewport: Some(ui.viewport),
@@ -2132,19 +2283,93 @@ impl Scene for GameScene {
 
         if let (Some(strip), Some(painter)) = (&self.rhythm_strip, &mut self.rhythm_painter) {
             let (x, y, width, height) = ui.viewport;
-            let strip_height = (((width.max(0) as u64 + 10) / 20) * 2)
-                .min((height.max(1) / 3) as u64)
-                .max(1) as i32;
+            let strip_height = (((width.max(0) as u64 + 10) / 20) * 2).min((height.max(1) / 3) as u64).max(1) as i32;
             let viewport = (x, y, width, strip_height);
             self.gl.flush();
             push_camera_state();
-            let mut rhythm_ui = Ui::new(painter, Some(viewport));
+            let layer = super::hdr_scene_input(self.res.config.hdr_output, &mut self.hdr_rhythm_frame, viewport, target);
+            let local_viewport = if self.hdr_rhythm_frame.is_some() { (0, 0, width, strip_height) } else { viewport };
+            let mut rhythm_ui = Ui::new(painter, Some(local_viewport));
             let mut camera = rhythm_ui.camera();
-            camera.render_target = target;
+            camera.render_target = layer;
             set_camera(&camera);
+            if self.hdr_rhythm_frame.is_some() {
+                clear_background(BLANK);
+            }
             strip.draw(self.res.time, &mut rhythm_ui);
+            if let Some(frame) = self.hdr_rhythm_frame.as_mut() {
+                frame.map_hdr(&crate::config::HdrLayerSettings::default());
+                let aspect = width as f32 / strip_height as f32;
+                set_camera(&Camera2D {
+                    zoom: vec2(1., aspect),
+                    viewport: Some(viewport),
+                    render_target: target,
+                    ..Default::default()
+                });
+                draw_texture_ex(frame.output().texture, -1., -1. / aspect, WHITE, DrawTextureParams {
+                    dest_size: Some(vec2(2., 2. / aspect)),
+                    ..Default::default()
+                });
+            }
             self.gl.flush();
             pop_camera_state();
+        }
+
+        if self.res.config.hdr_output {
+            for key in ["pause", "score", "scoreAim", "combo", "name", "level", "watermark", "pb", "progressText", "timeText", "line", "bar", "overlay"] {
+                let config = &self.res.config;
+                let visible = match key {
+                    "pause" => config.ui_pause,
+                    "score" => config.show_acc || (config.ui_score && !config.score_aim),
+                    "scoreAim" => config.ui_score && config.score_aim,
+                    "combo" => config.ui_combo && self.judge.combo() >= 3,
+                    "name" => config.ui_name,
+                    "level" => config.ui_level,
+                    "watermark" => !config.watermark.is_empty(),
+                    "pb" => config.ui_pb,
+                    "progressText" => config.show_progress_text,
+                    "timeText" => config.show_time_text,
+                    "line" => config.chart_debug,
+                    "bar" => config.bar,
+                    _ => tm.paused() || self.pause_rewind.is_some() || config.touch_debug || !self.touch_points.is_empty() || self.mode == GameMode::TweakOffset,
+                };
+                if !visible {
+                    continue;
+                }
+                let ui_target = self.res.hdr_ui_target.as_ref().expect("HDR UI target").input();
+                set_camera(&Camera2D {
+                    zoom: if key == "overlay" { vec2(1., -asp2) } else { vec2_asp },
+                    viewport: chart_target_vp,
+                    render_target: Some(ui_target),
+                    ..Default::default()
+                });
+                clear_background(BLANK);
+                if key == "overlay" {
+                    self.overlay_ui(ui, tm)?;
+                    if self.mode == GameMode::TweakOffset {
+                        set_camera(&Camera2D { zoom: vec2(1., asp), render_target: Some(ui_target), ..Default::default() });
+                        self.tweak_offset(ui, Self::interactive(&self.res, &self.state), tm);
+                    }
+                } else {
+                    self.ui(ui, tm, Some(key))?;
+                }
+
+                let setting_key = if key == "overlay" { "pause" } else { key };
+                let settings = self.res.config.hdr_settings.ui.get(setting_key).cloned().unwrap_or_default();
+                let ui_target = self.res.hdr_ui_target.as_mut().expect("HDR UI target");
+                ui_target.map_hdr(&settings);
+                let texture = ui_target.output().texture;
+                set_camera(&Camera2D {
+                    zoom: vec2(1., asp),
+                    viewport: Some(ui.viewport),
+                    render_target: self.res.camera.render_target,
+                    ..Default::default()
+                });
+                draw_texture_ex(texture, -1., -ui.top, WHITE, DrawTextureParams {
+                    dest_size: Some(vec2(2., ui.top * 2.)),
+                    ..Default::default()
+                });
+            }
         }
 
         Ok(())

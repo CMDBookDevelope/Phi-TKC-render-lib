@@ -85,6 +85,12 @@ pub struct Chart {
 }
 
 impl Chart {
+    /// Note positions at their hit times, in the same line-major order as
+    /// `lines[*].notes`. Screen center is x=0, with the sides at x=±1.
+    pub fn note_hit_positions(&self, config: &crate::config::Config, aspect: f32) -> Vec<Vector> {
+        crate::hand::planner::hit_positions(&self.lines, config, aspect)
+    }
+
     pub fn new(offset: f32, lines: Vec<JudgeLine>, bpm_list: BpmList, settings: ChartSettings, extra: ChartExtra) -> Self {
         let mut attach_ui = [None; 7];
         let mut order = (0..lines.len())
@@ -340,8 +346,19 @@ impl Chart {
         let mut gpu = self.render_gpu.borrow_mut();
         gpu.resize_with(self.lines.len(), LineRenderGpu::default);
         res.apply_model_of(&Matrix::identity().append_nonuniform_scaling(&Vector::new(if res.config.flip_x() { -1. } else { 1. }, -1.)), |res| {
+            let mut gl = unsafe { get_internal_gl() };
+            let old_pass = gl.quad_gl.get_active_render_pass();
+            if let Some(target) = &res.hdr_line_target {
+                gl.flush();
+                gl.quad_gl.render_pass(Some(target.input().render_pass));
+                clear_background(BLANK);
+            }
             for &id in &self.order {
                 self.lines[id].render_prepared(ui, res, &self.lines, &buffers[id], &mut gpu[id], id);
+            }
+            if res.hdr_line_target.is_some() {
+                gl.flush();
+                gl.quad_gl.render_pass(old_pass);
             }
             res.note_buffer.borrow_mut().draw_all();
         });
@@ -352,6 +369,12 @@ impl Chart {
     /// the shader samples that texture.
     pub fn block_effect_zones(&self, res: &Resource) -> Vec<Zone> {
         self.block_zones(res).to_vec()
+    }
+
+    pub(crate) fn has_visible_rpe_block_effect(&self, time: f64) -> bool {
+        !self.noise_skins.borrow().is_empty() && self.block_areas.iter().any(|area| {
+            area.animation.is_some() && area.phase(time) != super::BlockPhase::Hidden
+        })
     }
 
     pub fn draw_rpe_block_effect(&self, mut scene: Texture2D, time: f64, aspect: f32, dst: (f32, f32, f32, f32)) {

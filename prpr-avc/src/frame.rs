@@ -34,6 +34,24 @@ impl AVFrame {
     pub fn line_size(&self) -> i32 {
         unsafe { self.0.as_ref().linesize[0] }
     }
+
+    pub(crate) fn best_effort_timestamp(&self) -> Option<i64> {
+        let pts = unsafe { self.0.as_ref().best_effort_timestamp };
+        (pts != i64::MIN).then_some(pts)
+    }
+
+    pub fn copy_plane(&self, index: usize, width: usize, height: usize, output: &mut [u8]) {
+        let frame = unsafe { self.0.as_ref() };
+        let stride = frame.linesize[index];
+        assert!(stride >= width as i32 && !frame.data[index].is_null());
+        assert_eq!(output.len(), width * height);
+        for (row, dst) in output.chunks_exact_mut(width).enumerate() {
+            let src = unsafe {
+                std::slice::from_raw_parts(frame.data[index].add(row * stride as usize), width)
+            };
+            dst.copy_from_slice(src);
+        }
+    }
 }
 
 impl Drop for AVFrame {
