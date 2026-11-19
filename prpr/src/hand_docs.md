@@ -1,251 +1,36 @@
-# Hand.rs 模块技术文档
+# 手序规划
 
-## 1. 模块架构详解
+渲染与预览使用 `hand/planner.rs` 的确定性布局/时间规划器。它在 `Chart::update` 首次启用手序时为整个谱面分配左右手；窗口纵横比、谱面比例、水平镜像或音符数量改变时重新规划。结果保存在该谱面的音符中，后续帧不做推理，不创建额外 GPU/线程，不读取 framebuffer，也不在线训练或向当前工作目录写模型。不同谱面没有共享手序历史。
 
-### 1.1 整体架构图
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Hand Assignment System                   │
-├───────────────┬───────────────┬───────────────┬───────────────┤
-│  AI Worker    │ Request       │ Response      │ Line State    │
-│  Thread       │ Queue         │ Queue         │ Management    │
-├───────────────┼───────────────┼───────────────┼───────────────┤
-│ Async Processing │ Thread Pool │ Feature       │ Note Matching │
-└─────────────────────────────────────────────────────────────────┘
-```
+规划在每个音符的击打时间采样判线/音符动画，先旋转局部音符，再加上包含父判线的世界平移。控制曲线与 incline 纳入横坐标；水平镜像交换屏幕左右。动画采样不修改渲染器的时间或游标。
 
-### 1.2 核心组件交互流程
-1. **请求发起**：主线程调用`assign_hands`函数
-2. **状态检查**：检查谱面行(line)的更新状态和待处理请求数
-3. **请求提交**：创建AI处理请求并发送到工作线程
-4. **异步处理**：AI工作线程处理请求并返回结果
-5. **结果合并**：主线程接收响应并合并到原始音符数据
+真实音符按时间处理，同一击打时刻的所有判线共享手部状态。双方空闲时同时音符从左到右分给双手；多键按空间位置分组。单键综合左右位置、近期移动与重复用手代价；快速居中单键交替，远离中心的同侧连键不会因固定次数限制被强制分给另一只手。长按保留手部占用直到结束，远离长按位置的后续音符优先用另一手，附近额外手指仍然允许。假音符按空间侧分色，不改变真实音符的手部占用或交替。
 
-## 2. 核心结构深度解析
+这是一套可解释的手写规则模型，不是从人工标注数据训练的 ViT/PPO 权重，也不保证每个高难/多指/交叉手谱面都等价于谱师的唯一推荐打法。颜色表示一种稳定、可达性优先的左右手规划。
 
-### 2.1 主要数据结构
+## 模型资源与回退
 
-#### AiRequest 结构体
-```rust
-struct AiRequest {
-    id: u64,                    // 请求唯一ID
-    line_id: usize,             // 谱面行ID
-    version: u64,               // 请求版本号
-    timestamp: Instant,         // 请求时间戳
-    notes: Vec<Note>,           // 音符数据快照
-    rotation: f32,              // 谱面旋转角度
-    config: Arc<Config>,        // 游戏配置
-    bpm_list: Arc<BpmList>,     // BPM列表
-}
-```
+`prpr/assets/phitk_ai_model.bin` 是实际使用的 60 字节不可变参数模型，由 `prpr/tools/build-hand-model.py` 重现。应用的 `src-tauri/assets/phitk_ai_model.bin` 应与它逐字节相同，随完整 assets 树进入桌面安装包、便携包、Android APK 与 iOS IPA。Android 原生资源导入按目录递归复制该文件。
 
-#### AiResponse 结构体
-```rust
-struct AiResponse {
-    id: u64,                    // 对应请求ID
-    line_id: usize,             // 谱面行ID
-    version: u64,               // 响应版本号
-    timestamp: Instant,         // 响应时间戳
-    notes: Vec<Note>,           // 处理后的音符数据
-    checksum: u64,              // 数据校验和
-}
-```
+规划器通过 `include_bytes!` 内嵌同一个资源，因此 iOS 沙箱、Android assets 路径以及桌面启动工作目录不会使判断失效。开发者可以用环境变量 `PHITK_HAND_MODEL` 显式指定同格式覆盖文件；缺失、损坏、未知版本、非有限/越界参数以及旧 `PHITKAI` v3 神经网络文件都会回退到内嵌模型，不写入或替换原文件。即使内嵌文件格式异常，内置同值参数仍可保证规划可用。
 
-#### LineState 结构体
-```rust
-struct LineState {
-    current_version: u64,                       // 当前版本
-    last_full_update: Instant,                  // 上次完整更新时间
-    last_light_update: Instant,                 // 上次轻量更新时间
-    pending_requests: HashMap<u64, (Instant, u64)>, // 待处理请求
-}
-```
+格式为小端：8 字节 magic `PHITKHP\0`、u32 版本 `1`、u32 参数数量 `10`、10 个 f32 参数、u32 FNV-1a 校验和（前 56 字节）。空间单位为游戏区域半宽，时间单位为秒。
 
-### 2.2 PhiTKAdvancedAI 结构体
+| 参数 | 值 | 用途 |
+| --- | --- | --- |
+| home | 0.45 | 左/右手自然位置距中心的距离 |
+| spatial | 2.0 | 离自然侧的距离代价 |
+| travel | 0.35 | 近期移动代价 |
+| reuse | 0.9 | 快速重复同手的代价 |
+| reuse_window | 0.18 s | 重复代价消退时间 |
+| relax_time | 1.0 s | 手部回归自然位置时间 |
+| chord_epsilon | 0.003 s | 同时音符分组误差 |
+| hold_reach | 0.30 | 长按旁另一手指的可达距离 |
+| hold_penalty | 8.0 | 长按期间远距离移动代价 |
+| chord_extra | 0.6 | 同时多键集中同手的代价 |
 
-#### 核心字段
-| 字段 | 类型 | 作用 |
-|------|------|------|
-| `main_network` | DeepNeuralNetwork | 主神经网络 |
-| `target_network` | DeepNeuralNetwork | 目标网络（用于Q-learning） |
-| `feature_extractor` | AdvancedFeatureExtractor | 特征提取器 |
-| `experience_replay` | ExperienceReplay | 经验回放缓冲区 |
-| `rotation` | f32 | 谱面旋转角度 |
-| `game_mode` | GameMode | 游戏模式（2指/4指） |
-| `recent_assignments` | VecDeque<(Hand, f32, f32)> | 最近分配记录 |
-| `hand_switch_count` | u32 | 手部切换计数 |
+## 旧实验 API
 
-#### 神经网络架构
-- **输入层**: 40维特征向量
-- **LSTM层**: 3层双向LSTM (40→128→128→128 hidden units)
-- **Attention层**: 2层注意力机制 (256→128→64)
-- **Dense层**: 6层全连接层 (64→512→256→256→128→128→64)
-- **输出层**: 5维输出 (左右手置信度、稳定性指标等)
+`PhiTKAdvancedAI`、`vit`、`network`、`trainer` 保留给旧调用方使用，渲染路径不调用它们。原实现的 PPO 训练只更新 `DeepNeuralNetwork`，实际手序判断却来自未训练的随机 ViT；缺模型时创建随机网络并保存，不构成可分发的已训练模型。旧 worker 还会按判线反复克隆全谱、读回上一帧并异步合并，移动端可能积压或初始化第二个 GPU；这些行为已从渲染路径移除。
 
-#### GPU加速支持
-- 使用WebGPU进行矩阵运算加速
-- 自动检测软件渲染器并回退到CPU
-- 支持批量处理（batch_size=256）
-- 异步缓冲区映射和数据传输
-
-## 3. 核心算法实现
-
-### 3.1 手部分配主流程
-
-```rust
-pub fn assign_hands(notes: &mut [Note], config: &Config, line_id: usize, rotation: f32, bpm_list: &BpmList)
-```
-
-**执行流程**:
-1. 检查音符数组是否为空
-2. 启动AI工作线程（首次调用时）
-3. 获取谱面行状态
-4. 处理已完成的响应（批量处理最多5个）
-5. 判断是否需要发起新的完整更新请求
-6. 限制待处理请求数量（最多3个）
-
-### 3.2 音符匹配与合并算法
-
-```rust
-fn match_and_merge_notes(original: &mut [Note], updated: &[Note]) -> bool
-```
-
-**匹配策略**:
-- **时间窗口**: 50ms (0.05秒)
-- **位置阈值**: 20像素距离 (400平方)
-- **类型匹配**: 确保音符类型相同
-- **最优匹配**: 使用时间+距离的综合评分
-
-### 3.3 特征提取实现
-
-#### ProcessedNote 结构
-```rust
-struct ProcessedNote {
-    index: usize,           // 音符索引
-    position: Vector2,      // 位置坐标
-    time: f32,              // 时间戳
-    kind: NoteKind,         // 音符类型
-    assigned_hand: Option<Hand>, // 分配的手部
-    confidence: f32,        // 置信度
-    features: Vec<f32>,     // 特征向量
-    judge: JudgeStatus,     // 判定状态
-    difficulty: f32,        // 难度评分
-    duration: f32,          // 持续时间
-}
-```
-
-#### Vector2 工具方法
-- `distance_to()`: 计算两点间距离
-- `rotate()`: 旋转向量
-- `magnitude()`: 计算向量长度
-- `normalize()`: 向量归一化
-- `dot()`: 点积计算
-- `clean()`: 清理非有限值
-
-### 3.4 神经网络前向传播
-
-#### CPU实现 (`light_forward`)
-- 顺序处理各层
-- 支持Dense、LSTM、Attention、Residual层类型
-- 使用并行计算优化矩阵运算
-
-#### GPU实现 (`gpu_forward`)
-- 创建输入/输出缓冲区
-- 矩阵乘法计算
-- 激活函数应用
-- 异步结果读取
-- 失败时自动回退到CPU
-
-## 4. 异步处理机制
-
-### 4.1 线程模型
-- **主线程**: 负责游戏逻辑和UI渲染
-- **AI工作线程**: 专门处理手部分配请求
-- **响应分发线程**: 处理AI响应的分发
-
-### 4.2 请求管理
-- **请求频率**: 每20ms最多发起一次完整更新
-- **超时机制**: 请求5秒后自动过期
-- **资源限制**: 每行最多3个待处理请求
-- **批量响应**: 每帧最多处理5个响应
-
-### 4.3 错误处理
-- **Panic防护**: 使用`catch_unwind`防止AI崩溃影响主线程
-- **资源清理**: 定期清理过期请求（每30秒）
-- **校验机制**: 使用checksum验证响应数据完整性
-
-## 5. 性能优化策略
-
-### 5.1 内存优化
-- 使用`Arc`共享不可变数据（Config、BpmList）
-- 音符数据按需克隆，避免不必要的内存分配
-- 使用`VecDeque`实现高效的队列操作
-
-### 5.2 计算优化
-- 并行处理神经网络的矩阵运算
-- 批量处理多个响应减少锁竞争
-- 预排序音符索引优化匹配算法
-
-### 5.3 GPU优化
-- 异步缓冲区管理
-- 工作组大小优化（64线程/组）
-- 资源重用减少创建开销
-
-## 6. 配置与调优
-
-### 6.1 关键参数
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `FULL_UPDATE_INTERVAL_MS` | 20 | 完整更新间隔(ms) |
-| `REQUEST_TIMEOUT_MS` | 5000 | 请求超时时间(ms) |
-| `MAX_PENDING_REQUESTS` | 3 | 最大待处理请求数 |
-| `MAX_RESPONSES_PER_FRAME` | 5 | 每帧最大响应数 |
-
-### 6.2 神经网络参数
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `learning_rate` | 0.001 | 学习率 |
-| `momentum` | 0.9 | 动量参数 |
-| `dropout_rate` | 0.1 | Dropout率 |
-| `batch_size` | 256 | 批处理大小 |
-| `max_grad_norm` | 10.0 | 梯度裁剪阈值 |
-
-## 7. 使用示例
-
-### 7.1 基本用法
-```rust
-// 在游戏场景中调用手部分配
-assign_hands(
-    &mut judge_line.notes,
-    &config,
-    judge_line.id,
-    judge_line.rotation,
-    &bpm_list
-);
-```
-
-### 7.2 模型保存与加载
-```rust
-// 创建或加载AI模型
-let mut ai = PhiTKAdvancedAI::load_or_create("phitk_ai_model.bin", rotation, &config);
-
-// 初始化GPU（可选）
-ai.main_network.init_gpu_sync();
-ai.target_network.init_gpu_sync();
-```
-
-## 8. 调试与监控
-
-### 8.1 性能指标
-- `TOTAL_TOKENS_USED`: 总处理请求数
-- `correct_predictions`: 正确预测数
-- `average_reward`: 平均奖励值
-- `training_episodes`: 训练轮次
-
-### 8.2 日志输出
-- GPU初始化状态
-- 请求/响应处理状态
-- 错误和警告信息
-
----
-*本文档基于实际代码实现，最后更新时间：2025-10-06*
+兼容函数 `assign_hands_unified_perspective` 对调用方传入的世界坐标立即规划，不调用保留的图像闭包。需要跨判线的同时音符和稳定的跨帧颜色时使用 `Chart` 自身的规划生命周期。

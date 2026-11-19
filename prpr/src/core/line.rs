@@ -451,11 +451,7 @@ impl JudgeLine {
         let config = &res.config;
         let rot = self.object.rotation.now();
         let time = res.time;
-        let line_translation = world_pos;
-
-        let chart_ratio_inv = res.chart_ratio_inv;
-        let vw = 1.2 * chart_ratio_inv;
-        let vh = chart_ratio_inv;
+        let rotation = Rotation2::new(rot.to_radians());
 
         ENHANCED_NOTES_BUFFER.with(|buffer| {
             let mut positions = buffer.borrow_mut();
@@ -465,10 +461,7 @@ impl JudgeLine {
             for note in &self.notes {
                 let local_x = note.object.translation.0.now();
                 let local_y = note.object.translation.1.now();
-                positions.push(Vector::new(
-                    local_x * vw + line_translation.x,
-                    local_y * vh + line_translation.y,
-                ));
+                positions.push((world_pos + rotation * Vector::new(local_x, local_y / res.aspect_ratio)) * config.chart_ratio);
             }
 
             crate::hand::assign_hands_unified_perspective(
@@ -478,11 +471,7 @@ impl JudgeLine {
                 rot,
                 time,
                 &positions,
-                || {
-                    res.chart_target.as_ref()
-                        .map(|t| t.read_pixels_resized(crate::hand::AI_IMAGE_W, crate::hand::AI_IMAGE_H))
-                        .unwrap_or_else(|| vec![0.0; crate::hand::AI_IMAGE_SIZE])
-                },
+                Vec::new,
             );
         });
     }

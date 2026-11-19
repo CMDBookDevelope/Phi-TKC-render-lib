@@ -81,6 +81,7 @@ pub struct Chart {
     parents: Vec<Option<usize>>,
     render_buffers: RefCell<Vec<LineRenderBuffer>>,
     render_gpu: RefCell<Vec<LineRenderGpu>>,
+    hand_plan: Option<crate::hand::planner::PlanKey>,
 }
 
 impl Chart {
@@ -122,6 +123,7 @@ impl Chart {
             parents,
             render_buffers: RefCell::new(Vec::new()),
             render_gpu: RefCell::new(Vec::new()),
+            hand_plan: None,
         }
     }
 
@@ -243,6 +245,13 @@ impl Chart {
 
     pub fn update(&mut self, res: &mut Resource) {
         crate::core::begin_readback_cycle();
+        if res.config.hand_split {
+            let key = crate::hand::planner::PlanKey::new(&self.lines, &res.config, res.aspect_ratio);
+            if self.hand_plan != Some(key) {
+                crate::hand::planner::assign_chart(&mut self.lines, &res.config, res.aspect_ratio);
+                self.hand_plan = Some(key);
+            }
+        }
         let count = self.lines.len();
         if self.parents.len() != count || self.lines.iter().zip(&self.parents).any(|(line, parent)| line.parent != *parent) {
             self.parents = self.lines.iter().map(|it| it.parent).collect();
@@ -281,10 +290,6 @@ impl Chart {
         let guard = self.bpm_list.borrow();
         for (index, line) in self.lines.iter_mut().enumerate() {
             line.finish_update(res, self.trs[index], &guard, index);
-
-            if res.config.hand_split {
-                line.update_hand_assign_with_world_pos(res, self.world_positions[index], index);
-            }
         }
         drop(guard);
 
