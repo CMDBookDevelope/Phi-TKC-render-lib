@@ -67,7 +67,39 @@ pub struct HdrSettings {
     pub block_area: HdrLayerSettings,
     pub note: HdrLayerSettings,
     pub background: HdrLayerSettings,
+    pub rhythm: RhythmHdrSettings,
+    pub hand_indicator: HandIndicatorHdrSettings,
+    pub hit_effect: HdrLayerSettings,
     pub ui: HashMap<String, HdrLayerSettings>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RhythmHdrSettings {
+    pub metronome: HdrLayerSettings,
+    pub note: HdrLayerSettings,
+    pub value: HdrLayerSettings,
+}
+
+impl Default for RhythmHdrSettings {
+    fn default() -> Self {
+        let layer = HdrLayerSettings::default();
+        Self { metronome: layer.clone(), note: layer.clone(), value: layer }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HandIndicatorHdrSettings {
+    pub left: HdrLayerSettings,
+    pub right: HdrLayerSettings,
+}
+
+impl Default for HandIndicatorHdrSettings {
+    fn default() -> Self {
+        let layer = HdrLayerSettings::default();
+        Self { left: layer.clone(), right: layer }
+    }
 }
 
 impl Default for HdrSettings {
@@ -93,7 +125,10 @@ impl Default for HdrSettings {
         Self {
             block_area: default_layer.clone(),
             note: default_layer.clone(),
-            background: default_layer,
+            background: default_layer.clone(),
+            rhythm: RhythmHdrSettings::default(),
+            hand_indicator: HandIndicatorHdrSettings::default(),
+            hit_effect: default_layer,
             ui,
         }
     }
@@ -180,6 +215,42 @@ mod hdr_tests {
     }
 
     #[test]
+    fn hdr_nested_sublayers_default_independently_for_legacy_and_partial_configs() {
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.hdr_settings.rhythm.metronome.mode, "sdr");
+        assert_eq!(legacy.hdr_settings.rhythm.note.mode, "sdr");
+        assert_eq!(legacy.hdr_settings.hand_indicator.left.mode, "sdr");
+        assert_eq!(legacy.hdr_settings.hit_effect.mode, "sdr");
+        assert_eq!(legacy.hand_left_color, "#3380FF");
+        assert_eq!(legacy.hand_right_color, "#FF99B3");
+        assert_eq!(legacy.hand_left_opacity, 1.0);
+        assert_eq!(legacy.hand_right_opacity, 1.0);
+        assert!(legacy.hit_effect_enabled);
+
+        let partial: Config = serde_json::from_str(
+            r#"{"hdrSettings":{"rhythm":{"note":{"mode":"mapped","peakNits":2500}},"handIndicator":{"right":{"mode":"custom"}}}}"#,
+        ).unwrap();
+        assert_eq!(partial.hdr_settings.rhythm.note.mode, "mapped");
+        assert_eq!(partial.hdr_settings.rhythm.note.peak_nits, 2500.0);
+        assert_eq!(partial.hdr_settings.rhythm.metronome.mode, "sdr");
+        assert_eq!(partial.hdr_settings.rhythm.value.mode, "sdr");
+        assert_eq!(partial.hdr_settings.hand_indicator.left.mode, "sdr");
+        assert_eq!(partial.hdr_settings.hand_indicator.right.mode, "custom");
+        assert_eq!(partial.hdr_settings.hit_effect.mode, "sdr");
+    }
+
+    #[test]
+    fn custom_hand_tint_values_round_trip_and_hit_effect_toggle_defaults_on() {
+        let config: Config = serde_json::from_str(
+            r##"{"handLeftColor":"#123abc","handRightOpacity":0.35,"hitEffectEnabled":false}"##,
+        ).unwrap();
+        assert_eq!(config.hand_left_color, "#123abc");
+        assert_eq!(config.hand_right_opacity, 0.35);
+        assert!(!config.hit_effect_enabled);
+        assert_eq!(config.hand_left_opacity, 1.0);
+    }
+
+    #[test]
     fn custom_layer_is_bounded_and_monotonic() {
         let settings = HdrLayerSettings {
             mode: "custom".into(),
@@ -261,6 +332,14 @@ pub struct Config {
     pub color_space: String,
     /// Per-layer mapping controls used when HDR presentation is available.
     pub hdr_settings: HdrSettings,
+    /// Hex tint colors used for left/right hand-split notes.
+    pub hand_left_color: String,
+    pub hand_right_color: String,
+    /// Hand tint strength. 1.0 preserves the historical full tint.
+    pub hand_left_opacity: f32,
+    pub hand_right_opacity: f32,
+    /// Show judgement hit effects (bad-note flashes and hit particles).
+    pub hit_effect_enabled: bool,
     //test
     pub touch_debug: bool,
     pub volume_music: f32,
@@ -353,6 +432,11 @@ impl Default for Config {
             hdr_output: false,
             color_space: "rec709".to_owned(),
             hdr_settings: HdrSettings::default(),
+            hand_left_color: "#3380FF".to_owned(),
+            hand_right_color: "#FF99B3".to_owned(),
+            hand_left_opacity: 1.0,
+            hand_right_opacity: 1.0,
+            hit_effect_enabled: true,
             disable_loading: false,
             target_audio: 96000,
 

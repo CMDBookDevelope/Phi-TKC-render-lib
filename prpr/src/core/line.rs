@@ -890,6 +890,9 @@ impl LineRenderTask<'_> {
                     model,
                     note_buffer: &notes.buffer,
                     ctrl_identity,
+                    hand_layer: if res.config.hdr_output && res.config.hand_split {
+                        match note.hand { super::note::Hand::Left => 1, super::note::Hand::Right => 2 }
+                    } else { 0 },
                 }, &mut config, bpm_list);
             }
         };

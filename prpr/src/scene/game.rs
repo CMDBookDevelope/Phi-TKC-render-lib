@@ -350,7 +350,7 @@ pub struct GameScene {
     pub music: Music,
     rhythm_strip: Option<RhythmStrip>,
     rhythm_painter: Option<TextPainter>,
-    hdr_rhythm_frame: Option<crate::core::MSRenderTarget>,
+    hdr_rhythm_frames: [Option<crate::core::MSRenderTarget>; 3],
     premultiplied_blit: Option<crate::core::PremultipliedBlit>,
 
     state: State,
@@ -743,7 +743,7 @@ impl GameScene {
             music,
             rhythm_strip,
             rhythm_painter,
-            hdr_rhythm_frame: None,
+            hdr_rhythm_frames: [None, None, None],
             premultiplied_blit,
 
             state: State::Starting,
@@ -2047,13 +2047,40 @@ impl Scene for GameScene {
                 .or_else(|| res.camera.render_pass()),
         );
 
-        self.bad_notes.retain(|dummy| dummy.render(res));
         let t = tm.real_time();
         let dt = (t - std::mem::replace(&mut self.last_update_time, t)) as f32;
-        // With 噪域 present these layers are replayed after the block-area pass
-        // (see below) so hit effects stay above it.
-        if (!has_block_effect || res.config.hdr_output) && res.config.particle {
-            res.emitter.draw(dt);
+        // Hit flashes and particles have their own HDR mapping controls and do
+        // not borrow the note layer's transfer function.
+        if res.config.hdr_output {
+            let hit_enabled = res.config.hit_effect_enabled;
+            let hit_pass = {
+                let hit_target = res.hdr_hit_target.as_mut().expect("HDR hit-effect target");
+                hit_target.begin_frame();
+                hit_target.input()
+            };
+            set_camera(&Camera2D {
+                zoom: vec2_asp,
+                viewport: chart_target_vp,
+                render_target: Some(hit_pass),
+                ..Default::default()
+            });
+            clear_background(BLANK);
+            if hit_enabled {
+                self.bad_notes.retain(|dummy| dummy.render(res));
+                res.note_buffer.borrow_mut().draw_all();
+                if res.config.particle {
+                    res.emitter.draw(dt);
+                }
+            } else {
+                self.bad_notes.clear();
+            }
+            self.gl.flush();
+            res.hdr_hit_target.as_mut().expect("HDR hit-effect target").map_hdr(&res.config.hdr_settings.hit_effect);
+        } else {
+            self.bad_notes.retain(|dummy| dummy.render(res));
+            if (!has_block_effect || res.config.hdr_output) && res.config.particle && res.config.hit_effect_enabled {
+                res.emitter.draw(dt);
+            }
         }
         drop(res);
         let res = &mut self.res;
@@ -2133,6 +2160,14 @@ impl Scene for GameScene {
             draw_texture_ex(background_texture, -1., -ui.top, WHITE, DrawTextureParams { dest_size: Some(vec2(2., ui.top * 2.)), ..Default::default() });
             draw_texture_ex(line_texture, -1., -ui.top, WHITE, DrawTextureParams { dest_size: Some(vec2(2., ui.top * 2.)), ..Default::default() });
             draw_texture_ex(note_texture, -1., -ui.top, WHITE, DrawTextureParams { dest_size: Some(vec2(2., ui.top * 2.)), ..Default::default() });
+            if self.res.config.hand_split {
+                for hand_target in self.res.hdr_hand_targets.iter().flatten() {
+                    draw_texture_ex(hand_target.output().texture, -1., -ui.top, WHITE, DrawTextureParams {
+                        dest_size: Some(vec2(2., ui.top * 2.)),
+                        ..Default::default()
+                    });
+                }
+            }
             let scene_texture = scene_target.output().texture;
 
             if has_block_effect {
@@ -2289,35 +2324,66 @@ impl Scene for GameScene {
             self.gl.flush();
         }
 
+        if self.res.config.hdr_output && self.res.config.hit_effect_enabled {
+            self.gl.flush();
+            let texture = self.res.hdr_hit_target.as_ref().expect("HDR hit-effect target").output().texture;
+            set_camera(&Camera2D {
+                zoom: vec2(1., asp),
+                viewport: Some(ui.viewport),
+                render_target: self.res.camera.render_target,
+                ..Default::default()
+            });
+            draw_texture_ex(texture, -1., -ui.top, WHITE, DrawTextureParams {
+                dest_size: Some(vec2(2., ui.top * 2.)),
+                ..Default::default()
+            });
+            self.gl.flush();
+        }
+
         if let (Some(strip), Some(painter)) = (&self.rhythm_strip, &mut self.rhythm_painter) {
             let (x, y, width, height) = ui.viewport;
             let strip_height = (((width.max(0) as u64 + 10) / 20) * 2).min((height.max(1) / 3) as u64).max(1) as i32;
             let viewport = (x, y, width, strip_height);
             self.gl.flush();
             push_camera_state();
-            let layer = super::hdr_scene_input(self.res.config.hdr_output, &mut self.hdr_rhythm_frame, viewport, target);
-            let local_viewport = if self.hdr_rhythm_frame.is_some() { (0, 0, width, strip_height) } else { viewport };
-            let mut rhythm_ui = Ui::new(painter, Some(local_viewport));
-            let mut camera = rhythm_ui.camera();
-            camera.render_target = layer;
-            set_camera(&camera);
-            if self.hdr_rhythm_frame.is_some() {
-                clear_background(BLANK);
-            }
-            strip.draw(self.res.time, &mut rhythm_ui);
-            if let Some(frame) = self.hdr_rhythm_frame.as_mut() {
-                frame.map_hdr(&crate::config::HdrLayerSettings::default());
+            let mut rhythm_ui;
+            if self.res.config.hdr_output {
+                let settings = &self.res.config.hdr_settings.rhythm;
+                let layers = [
+                    (crate::core::rhythm::RhythmRenderLayer::Metronome, &settings.metronome),
+                    (crate::core::rhythm::RhythmRenderLayer::Note, &settings.note),
+                    (crate::core::rhythm::RhythmRenderLayer::Value, &settings.value),
+                ];
                 let aspect = width as f32 / strip_height as f32;
-                set_camera(&Camera2D {
-                    zoom: vec2(1., aspect),
-                    viewport: Some(viewport),
-                    render_target: target,
-                    ..Default::default()
-                });
-                draw_texture_ex(frame.output().texture, -1., -1. / aspect, WHITE, DrawTextureParams {
-                    dest_size: Some(vec2(2., 2. / aspect)),
-                    ..Default::default()
-                });
+                for (index, (layer_kind, layer_settings)) in layers.into_iter().enumerate() {
+                    let layer = super::hdr_scene_input(true, &mut self.hdr_rhythm_frames[index], viewport, target);
+                    let mut layer_ui = Ui::new(painter, Some((0, 0, width, strip_height)));
+                    let mut camera = layer_ui.camera();
+                    camera.render_target = layer;
+                    set_camera(&camera);
+                    clear_background(BLANK);
+                    strip.draw_sampled_layer(self.res.time, None, &mut layer_ui, layer_kind);
+                    self.gl.flush();
+                    let frame = self.hdr_rhythm_frames[index].as_mut().expect("HDR rhythm sublayer");
+                    frame.map_hdr(layer_settings);
+                    set_camera(&Camera2D {
+                        zoom: vec2(1., aspect),
+                        viewport: Some(viewport),
+                        render_target: target,
+                        ..Default::default()
+                    });
+                    draw_texture_ex(frame.output().texture, -1., -1. / aspect, WHITE, DrawTextureParams {
+                        dest_size: Some(vec2(2., 2. / aspect)),
+                        ..Default::default()
+                    });
+                    self.gl.flush();
+                }
+            } else {
+                rhythm_ui = Ui::new(painter, Some(viewport));
+                let mut camera = rhythm_ui.camera();
+                camera.render_target = target;
+                set_camera(&camera);
+                strip.draw(self.res.time, &mut rhythm_ui);
             }
             self.gl.flush();
             pop_camera_state();

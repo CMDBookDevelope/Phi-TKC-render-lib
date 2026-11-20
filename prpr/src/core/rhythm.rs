@@ -259,6 +259,20 @@ impl RhythmValue {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RhythmRenderLayer {
+    All,
+    Metronome,
+    Note,
+    Value,
+}
+
+impl RhythmRenderLayer {
+    fn draws_metronome(self) -> bool { matches!(self, Self::All | Self::Metronome) }
+    fn draws_notes(self) -> bool { matches!(self, Self::All | Self::Note) }
+    fn draws_values(self) -> bool { matches!(self, Self::All | Self::Value) }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RhythmKind {
     Tap,
     Drag,
@@ -477,10 +491,23 @@ impl RhythmStrip {
     /// No music offset, playback speed, or preroll is applied here: the caller
     /// has already resolved those in the scene's judgement clock.
     pub fn draw(&self, chart_time: f32, ui: &mut Ui) {
-        self.draw_sampled(chart_time, None, ui);
+        self.draw_sampled_layer(chart_time, None, ui, RhythmRenderLayer::All);
     }
 
     pub(super) fn draw_sampled(&self, chart_time: f32, previous_time: Option<f32>, ui: &mut Ui) {
+        self.draw_sampled_layer(chart_time, previous_time, ui, RhythmRenderLayer::All);
+    }
+
+    pub(crate) fn draw_sampled_layer(
+        &self,
+        chart_time: f32,
+        previous_time: Option<f32>,
+        ui: &mut Ui,
+        layer: RhythmRenderLayer,
+    ) {
+        let draw_metronome = layer.draws_metronome();
+        let draw_notes = layer.draws_notes();
+        let draw_values = layer.draws_values();
         let time = if chart_time.is_finite() { chart_time } else { 0. };
         let top = ui.top;
         let h = 2. * top;
@@ -490,6 +517,7 @@ impl RhythmStrip {
         let now = self.beat_at(time);
         let pulse = metronome_pulse_sampled(now, previous_time.map(|time| self.beat_at(time)), previous_time.map_or(0., |previous| time - previous));
         let bg = mix(self.palette[0], Color::new(0.035, 0.043, 0.06, 1.), 0.88);
+        if draw_metronome {
         ui.fill_rect(ui.screen_rect(), (mix(bg, self.palette[1], 0.10), (-1., -top), bg, (1., top)));
         ui.fill_rect(Rect::new(-1., -top, 2., h * 0.014), alpha(WHITE, 0.19));
         ui.fill_rect(Rect::new(left, -top, 2. - h, h), (alpha(WHITE, 0.065), (left, -top), alpha(WHITE, 0.), (left, top)));
@@ -523,9 +551,17 @@ impl RhythmStrip {
         text(ui, "BEAT", cx, h * 0.18, h * 0.83, alpha(self.palette[0], 0.8));
         ui.fill_rect(Rect::new(left, -top + h * 0.10, h * 0.004, h * 0.80), alpha(WHITE, 0.16));
 
+        }
+
         let bands = RhythmBands::new(left, h);
-        ui.fill_rect(bands.labels, alpha(Color::new(0.02, 0.025, 0.035, 1.), 0.58));
-        ui.fill_rect(Rect::new(left, bands.labels.y, 1. - left, h * 0.003), alpha(WHITE, 0.08));
+        let note_margin = bands.notes.h * NOTE_HEIGHT_RATIO / 1.5 * 1.27;
+        let first = self.beat_at(time + (left - judge - note_margin) / pitch);
+        let last = self.beat_at(time + (1. - judge + note_margin) / pitch);
+        if draw_metronome {
+            ui.fill_rect(bands.labels, alpha(Color::new(0.02, 0.025, 0.035, 1.), 0.58));
+            ui.fill_rect(Rect::new(left, bands.labels.y, 1. - left, h * 0.003), alpha(WHITE, 0.08));
+        }
+        if draw_notes {
         // Onset heads and their glows are physically clipped above the label
         // band, including when future notes overlap each other.
         ui.scissor(Some(bands.notes));
@@ -541,9 +577,6 @@ impl RhythmStrip {
         }
         ui.fill_rect(Rect::new(left, -h * 0.003, 1. - left, h * 0.006), alpha(WHITE, 0.05));
 
-        let note_margin = bands.notes.h * NOTE_HEIGHT_RATIO / 1.5 * 1.27;
-        let first = self.beat_at(time + (left - judge - note_margin) / pitch);
-        let last = self.beat_at(time + (1. - judge + note_margin) / pitch);
         // Soft line glow never obscures the note glyph, which is drawn last.
         for layer in 0..3 {
             let w = h * (0.023 - layer as f32 * 0.007);
@@ -579,6 +612,9 @@ impl RhythmStrip {
                 RhythmKind::Hold | RhythmKind::Tap => {}
             }
         }
+        ui.scissor(None);
+        }
+        if draw_values {
         ui.scissor(Some(bands.labels));
         // Labels are painted after every note, in a dedicated larger band.
         // Global onset aggregation supplies exactly one label per analysis note.
@@ -590,6 +626,7 @@ impl RhythmStrip {
             text(ui, &note.value.label(), x, bands.label_y, bands.label_size, alpha(WHITE, 0.86));
         }
         ui.scissor(None);
+        }
     }
 }
 
@@ -952,6 +989,19 @@ fn lab_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rhythm_render_layers_are_independently_selectable() {
+        let all = RhythmRenderLayer::All;
+        assert!(all.draws_metronome() && all.draws_notes() && all.draws_values());
+        for layer in [RhythmRenderLayer::Metronome, RhythmRenderLayer::Note, RhythmRenderLayer::Value] {
+            let flags = [layer.draws_metronome(), layer.draws_notes(), layer.draws_values()];
+            assert_eq!(flags.into_iter().filter(|enabled| *enabled).count(), 1);
+        }
+        assert!(RhythmRenderLayer::Metronome.draws_metronome());
+        assert!(RhythmRenderLayer::Note.draws_notes());
+        assert!(RhythmRenderLayer::Value.draws_values());
+    }
 
     fn strip(events: Vec<(f32, f32, RhythmKind)>, tempo: BpmList) -> RhythmStrip {
         RhythmStrip::from_events(tempo, events, cover_palette(None))

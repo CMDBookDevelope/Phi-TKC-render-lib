@@ -103,6 +103,7 @@ pub struct RhythmComposite {
     frame_sample: Cell<RhythmFrameSample>,
     preserve_alpha: bool,
     hdr: bool,
+    rhythm_hdr_settings: crate::config::RhythmHdrSettings,
     premultiplied_blit: Option<PremultipliedBlit>,
 }
 
@@ -133,6 +134,23 @@ impl RhythmComposite {
         preserve_alpha: bool,
     ) -> Result<Self> {
         Self::with_format(width, height, strip, slots, preserve_alpha, true)
+    }
+
+    pub fn new_hdr_with_settings(
+        width: u32,
+        height: u32,
+        strip: Option<RhythmStrip>,
+        slots: usize,
+        preserve_alpha: bool,
+        settings: crate::config::RhythmHdrSettings,
+    ) -> Result<Self> {
+        let mut composite = Self::with_format(width, height, strip, slots, preserve_alpha, true)?;
+        composite.rhythm_hdr_settings = settings;
+        Ok(composite)
+    }
+
+    pub fn set_hdr_settings(&mut self, settings: crate::config::RhythmHdrSettings) {
+        self.rhythm_hdr_settings = settings;
     }
 
     fn with_format(
@@ -187,6 +205,7 @@ impl RhythmComposite {
             frame_sample: Cell::new(RhythmFrameSample::default()),
             preserve_alpha,
             hdr,
+            rhythm_hdr_settings: crate::config::RhythmHdrSettings::default(),
             premultiplied_blit,
         })
     }
@@ -206,6 +225,44 @@ impl RhythmComposite {
             .as_ref()
             .expect("enabled rhythm strip has its own painter")
             .borrow_mut();
+        if self.hdr {
+            let width = self.layout.width as f32;
+            let game_height = self.layout.game_height as f32;
+            let mut output_camera = Camera2D::from_display_rect(Rect::new(0., 0., width, self.layout.output_height as f32));
+            output_camera.render_target = Some(output_target.input());
+            set_camera(&output_camera);
+            clear_background(if self.preserve_alpha { Color::new(0., 0., 0., 0.) } else { BLACK });
+            draw_texture_ex(game.output().texture, 0., 0., WHITE, DrawTextureParams {
+                dest_size: Some(vec2(width, game_height)),
+                flip_y: true,
+                ..Default::default()
+            });
+            let layers = [
+                (super::rhythm::RhythmRenderLayer::Metronome, &self.rhythm_hdr_settings.metronome),
+                (super::rhythm::RhythmRenderLayer::Note, &self.rhythm_hdr_settings.note),
+                (super::rhythm::RhythmRenderLayer::Value, &self.rhythm_hdr_settings.value),
+            ];
+            for (kind, settings) in layers {
+                strip_target.begin_frame();
+                let mut ui = Ui::new(&mut painter, Some((0, 0, self.layout.width as i32, self.layout.strip_height as i32)));
+                let mut camera = ui.camera();
+                camera.render_target = Some(strip_target.input());
+                set_camera(&camera);
+                clear_background(BLANK);
+                strip.draw_sampled_layer(sample.time.unwrap_or(0.), sample.previous_time, &mut ui, kind);
+                unsafe { get_internal_gl() }.flush();
+                strip_target.map_hdr(settings);
+                set_camera(&output_camera);
+                draw_texture_ex(strip_target.output().texture, 0., game_height, WHITE, DrawTextureParams {
+                    dest_size: Some(vec2(width, self.layout.strip_height as f32)),
+                    flip_y: true,
+                    ..Default::default()
+                });
+                unsafe { get_internal_gl() }.flush();
+            }
+            pop_camera_state();
+            return output_target.output();
+        }
         let mut ui = Ui::new(&mut painter, Some((0, 0, self.layout.width as i32, self.layout.strip_height as i32)));
         let mut camera = ui.camera();
         camera.render_target = Some(strip_target.input());

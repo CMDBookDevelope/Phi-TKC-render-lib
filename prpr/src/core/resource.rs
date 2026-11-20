@@ -349,13 +349,13 @@ pub struct NoteBuffer {
 }
 
 struct NoteBucket {
-    key: (i8, u32),
+    key: (i8, i8, u32),
     vertices: Vec<Vertex>,
 }
 
 impl NoteBuffer {
     #[inline]
-    fn bucket_mut(&mut self, key: (i8, u32)) -> &mut Vec<Vertex> {
+    fn bucket_mut(&mut self, key: (i8, i8, u32)) -> &mut Vec<Vertex> {
         let index = match self.buckets.binary_search_by_key(&key, |bucket| bucket.key) {
             Ok(index) => index,
             Err(index) => {
@@ -367,7 +367,7 @@ impl NoteBuffer {
     }
 
     #[inline]
-    pub fn push(&mut self, key: (i8, u32), vertices: [Vertex; 4]) {
+    pub fn push(&mut self, key: (i8, i8, u32), vertices: [Vertex; 4]) {
         self.bucket_mut(key).extend_from_slice(&vertices);
     }
 
@@ -386,6 +386,14 @@ impl NoteBuffer {
     }
 
     pub fn draw_all(&mut self) {
+        self.draw_selected(None);
+    }
+
+    pub(crate) fn draw_group(&mut self, group: i8) {
+        self.draw_selected(Some(group));
+    }
+
+    fn draw_selected(&mut self, group: Option<i8>) {
         static INDICES: once_cell::sync::Lazy<Vec<u16>> = once_cell::sync::Lazy::new(|| {
             (0..DRAWCALL_QUADS as u16)
                 .flat_map(|it| {
@@ -399,10 +407,10 @@ impl NoteBuffer {
         let gl = gl.quad_gl;
         gl.draw_mode(DrawMode::Triangles);
         for bucket in &mut self.buckets {
-            if bucket.vertices.is_empty() {
+            if group.is_some_and(|group| bucket.key.0 != group) || bucket.vertices.is_empty() {
                 continue;
             }
-            let (_, tex_id) = bucket.key;
+            let (_, _, tex_id) = bucket.key;
             let vertices = &mut bucket.vertices;
             gl.texture(Some(Texture2D::from_miniquad_texture(unsafe { Texture::from_raw_id(tex_id, miniquad::TextureFormat::RGBA8) })));
             for chunk in vertices.chunks(DRAWCALL_QUADS * 4) {
@@ -455,6 +463,8 @@ pub struct Resource {
     pub hdr_scene_target: Option<MSRenderTarget>,
     pub hdr_block_target: Option<MSRenderTarget>,
     pub hdr_line_target: Option<MSRenderTarget>,
+    pub hdr_hit_target: Option<MSRenderTarget>,
+    pub hdr_hand_targets: [Option<MSRenderTarget>; 2],
     pub hdr_ui_target: Option<MSRenderTarget>,
     pub no_effect: bool,
     /// Refraction needs a resolved scene even when ordinary effects and MSAA are disabled.
@@ -595,6 +605,8 @@ impl Resource {
             hdr_scene_target: None,
             hdr_block_target: None,
             hdr_line_target: None,
+            hdr_hit_target: None,
+            hdr_hand_targets: [None, None],
             hdr_ui_target: None,
             no_effect,
             has_block_effect,
@@ -607,7 +619,7 @@ impl Resource {
     }
 
     pub fn emit_at_origin(&mut self, rotation: f32, color: Color) {
-        if !self.config.particle {
+        if !self.config.particle || !self.config.hit_effect_enabled {
             return;
         }
         let pt = self.world_to_screen(Point::default());
@@ -648,6 +660,12 @@ impl Resource {
             if self.hdr_scene_target.as_ref().map(MSRenderTarget::dimensions) != Some(size) {
                 self.hdr_scene_target = Some(MSRenderTarget::new_hdr(size, 1));
                 self.hdr_line_target = Some(MSRenderTarget::new_hdr(size, self.config.sample_count));
+                self.hdr_hit_target = Some(MSRenderTarget::new_hdr(size, 1));
+                self.hdr_hand_targets = if self.config.hand_split {
+                    [Some(MSRenderTarget::new_hdr(size, 1)), Some(MSRenderTarget::new_hdr(size, 1))]
+                } else {
+                    [None, None]
+                };
                 self.hdr_block_target = self.has_block_effect.then(|| MSRenderTarget::new_hdr(size, 1));
             }
         } else {
@@ -656,6 +674,8 @@ impl Resource {
             self.hdr_block_target = None;
             self.hdr_ui_target = None;
             self.hdr_line_target = None;
+            self.hdr_hit_target = None;
+            self.hdr_hand_targets = [None, None];
         }
         // The destination viewport is the only source of the canvas shape.
         // Legacy chart/config aspect fields must never crop the render target.
@@ -712,7 +732,7 @@ mod tests {
 
     #[test]
     fn note_buckets_preserve_layer_texture_and_submission_order() {
-        let mut reference = BTreeMap::<(i8, u32), Vec<f32>>::new();
+        let mut reference = BTreeMap::<(i8, i8, u32), Vec<f32>>::new();
         let mut buffer = NoteBuffer::default();
         for round in 0..3 {
             buffer.clear();
@@ -720,7 +740,7 @@ mod tests {
             for chunk in 0..5 {
                 let mut part = NoteBuffer::default();
                 for note in 0..25 {
-                    let key = (((note * 7 + chunk) % 4) as i8, ((note * 11 + round) % 5) as u32);
+                    let key = ((chunk % 3) as i8, ((note * 7 + chunk) % 4) as i8, ((note * 11 + round) % 5) as u32);
                     let id = (chunk * 25 + note) as f32;
                     part.push(key, [Vertex::new(id, 0., 0., 0., 0., WHITE); 4]);
                     reference.entry(key).or_default().extend([id; 4]);

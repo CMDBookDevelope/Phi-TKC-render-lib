@@ -360,7 +360,28 @@ impl Chart {
                 gl.flush();
                 gl.quad_gl.render_pass(old_pass);
             }
-            res.note_buffer.borrow_mut().draw_all();
+            if res.config.hdr_output && res.config.hand_split {
+                let note_pass = gl.quad_gl.get_active_render_pass();
+                let mut notes = res.note_buffer.borrow_mut();
+                notes.draw_group(0);
+                for (index, layer_settings) in [
+                    &res.config.hdr_settings.hand_indicator.left,
+                    &res.config.hdr_settings.hand_indicator.right,
+                ].into_iter().enumerate() {
+                    let hand_target = res.hdr_hand_targets[index].as_mut().expect("HDR hand-indicator target");
+                    hand_target.begin_frame();
+                    gl.flush();
+                    gl.quad_gl.render_pass(Some(hand_target.input().render_pass));
+                    gl.quad_gl.viewport(None);
+                    clear_background(BLANK);
+                    notes.draw_group(index as i8 + 1);
+                    gl.flush();
+                    hand_target.map_hdr(layer_settings);
+                    gl.quad_gl.render_pass(note_pass);
+                }
+            } else {
+                res.note_buffer.borrow_mut().draw_all();
+            }
         });
     }
 

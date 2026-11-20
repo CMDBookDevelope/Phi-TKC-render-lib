@@ -23,9 +23,42 @@ static INIT_POINTS: Lazy<[Point; 4]> = Lazy::new(|| [
 ]);
 static RANDOM_SEED: AtomicU32 = AtomicU32::new(0x12345678);
 static HAND_COLORS: Lazy<[Color; 2]> = Lazy::new(|| [
-    Color::new(0.2, 0.5, 1.0, 1.0),  // Left
-    Color::new(1.0, 0.6, 0.7, 1.0),  // Right
+    Color::new(0.2, 0.5, 1.0, 1.0),
+    Color::new(1.0, 0.6, 0.7, 1.0),
 ]);
+
+fn parse_hex_color(value: &str, fallback: Color) -> Color {
+    let digits = value.strip_prefix('#').unwrap_or(value);
+    if digits.len() != 6 || !digits.is_ascii() {
+        return fallback;
+    }
+    let Ok(rgb) = u32::from_str_radix(digits, 16) else { return fallback };
+    Color::new(
+        ((rgb >> 16) & 0xff) as f32 / 255.,
+        ((rgb >> 8) & 0xff) as f32 / 255.,
+        (rgb & 0xff) as f32 / 255.,
+        1.,
+    )
+}
+
+fn configured_hand_color(hand: Hand, value: &str) -> Color {
+    match hand {
+        Hand::Left if value.eq_ignore_ascii_case("#3380FF") => HAND_COLORS[0],
+        Hand::Right if value.eq_ignore_ascii_case("#FF99B3") => HAND_COLORS[1],
+        Hand::Left => parse_hex_color(value, HAND_COLORS[0]),
+        Hand::Right => parse_hex_color(value, HAND_COLORS[1]),
+    }
+}
+
+fn blend_hand_tint(base: Color, tint: Color, opacity: f32) -> Color {
+    let opacity = if opacity.is_finite() { opacity.clamp(0., 1.) } else { 1. };
+    Color::new(
+        base.r + (tint.r - base.r) * opacity,
+        base.g + (tint.g - base.g) * opacity,
+        base.b + (tint.b - base.b) * opacity,
+        base.a,
+    )
+}
 
 #[inline(always)]
 fn texture_gl_id(texture: &Texture2D) -> u32 {
@@ -171,6 +204,7 @@ pub(crate) struct NoteRenderContext<'a, 'b> {
     pub model: Matrix,
     pub note_buffer: &'a RefCell<super::resource::NoteBuffer>,
     pub ctrl_identity: bool,
+    pub hand_layer: i8,
 }
 
 impl<'a, 'b> Deref for NoteRenderContext<'a, 'b> {
@@ -267,7 +301,7 @@ fn draw_tex_pts(res: &Resource, texture: Texture2D, order: i8, p: [Point; 4], co
     ];
 
     res.note_buffer.borrow_mut().push(
-        (order, texture_gl_id(&texture)),
+        (0, order, texture_gl_id(&texture)),
         vertices
     );
 }
@@ -402,6 +436,9 @@ impl Note {
             model: res.model(),
             note_buffer: &res.note_buffer,
             ctrl_identity: *super::chart::IDENTITY_CTRL_FAST_PATH && config.ctrl_obj.is_identity(),
+            hand_layer: if res.config.hdr_output && res.config.hand_split {
+                match self.hand { Hand::Left => 1, Hand::Right => 2 }
+            } else { 0 },
         }, config, bpm_list);
     }
 
@@ -459,18 +496,22 @@ impl Note {
     let mut color = self.object.now_color();
 
     if res.config.hand_split {
-        let hand_color = match self.hand {
-            Hand::Left => &HAND_COLORS[0],
-            Hand::Right => &HAND_COLORS[1],
+        let (hex, opacity) = match self.hand {
+            Hand::Left => (&res.config.hand_left_color, res.config.hand_left_opacity),
+            Hand::Right => (&res.config.hand_right_color, res.config.hand_right_opacity),
         };
-        color.r = hand_color.r;
-        color.g = hand_color.g;
-        color.b = hand_color.b;
-        let luminance = color.r * 0.299 + color.g * 0.587 + color.b * 0.114;
-        let adjust = BASE_LUMINANCE / luminance.max(0.001);
-        color.r = (color.r * adjust).min(1.0);
-        color.g = (color.g * adjust).min(1.0);
-        color.b = (color.b * adjust).min(1.0);
+        let mut hand_color = configured_hand_color(self.hand, hex);
+        // Preserve the historical blue/pink appearance for existing presets.
+        if matches!(self.hand, Hand::Left) && hex.eq_ignore_ascii_case("#3380FF")
+            || matches!(self.hand, Hand::Right) && hex.eq_ignore_ascii_case("#FF99B3")
+        {
+            let luminance = hand_color.r * 0.299 + hand_color.g * 0.587 + hand_color.b * 0.114;
+            let adjust = BASE_LUMINANCE / luminance.max(0.001);
+            hand_color.r = (hand_color.r * adjust).min(1.0);
+            hand_color.g = (hand_color.g * adjust).min(1.0);
+            hand_color.b = (hand_color.b * adjust).min(1.0);
+        }
+        color = blend_hand_tint(color, hand_color, opacity);
     }
 
 
@@ -671,7 +712,7 @@ impl Note {
 
 
         res.note_buffer.borrow_mut().push(
-            (order, texture_gl_id(&tex)),
+            (res.hand_layer, order, texture_gl_id(&tex)),
             vertices
         );
     }
@@ -704,5 +745,39 @@ impl BadNote {
             );
         });
         true
+    }
+}
+
+#[cfg(test)]
+mod hand_tint_tests {
+    use super::*;
+
+    #[test]
+    fn hand_hex_colors_parse_case_insensitively_and_bad_values_fall_back() {
+        let parsed = parse_hex_color("#12aBef", WHITE);
+        assert!((parsed.r - 0x12 as f32 / 255.).abs() < f32::EPSILON);
+        assert!((parsed.g - 0xab as f32 / 255.).abs() < f32::EPSILON);
+        assert!((parsed.b - 0xef as f32 / 255.).abs() < f32::EPSILON);
+        assert_eq!(parse_hex_color("invalid", HAND_COLORS[0]), HAND_COLORS[0]);
+    }
+
+    #[test]
+    fn legacy_hand_defaults_are_exact_and_opacity_blends_from_original_to_full_tint() {
+        assert_eq!(configured_hand_color(Hand::Left, "#3380FF"), HAND_COLORS[0]);
+        assert_eq!(configured_hand_color(Hand::Right, "#FF99B3"), HAND_COLORS[1]);
+        let base = Color::new(0.8, 0.4, 0.2, 0.65);
+        let tint = Color::new(0.2, 0.6, 1.0, 1.0);
+        assert_eq!(blend_hand_tint(base, tint, 0.), base);
+        let full = blend_hand_tint(base, tint, 1.);
+        assert!((full.r - tint.r).abs() < 1e-6);
+        assert!((full.g - tint.g).abs() < 1e-6);
+        assert!((full.b - tint.b).abs() < 1e-6);
+        assert_eq!(full.a, base.a);
+        let half = blend_hand_tint(base, tint, 0.5);
+        assert!((half.r - 0.5).abs() < 1e-6);
+        assert!((half.g - 0.5).abs() < 1e-6);
+        assert!((half.b - 0.6).abs() < 1e-6);
+        assert_eq!(half.a, base.a);
+        assert_eq!(blend_hand_tint(base, tint, f32::NAN), blend_hand_tint(base, tint, 1.));
     }
 }
