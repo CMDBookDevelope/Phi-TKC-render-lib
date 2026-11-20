@@ -170,27 +170,6 @@ impl Scene for LoadingScene {
         });
 
         self.scene_background.borrow_mut().draw(*self.background, asp, tm.unscaled_time())?;
-        if self.config.background {
-            let main_width = 0.768;
-            let main_height = main_width * (self.illustration.height() as f32 / self.illustration.width() as f32);
-            let main = Rect::new(-main_width / 2.0, -main_height / 2.0, main_width, main_height);
-
-            draw_parallelogram(main, None, Color::new(0.0, 0.0, 0.0, 0.0), false);
-
-            let _r = draw_illustration(
-                *self.illustration,
-                main.x + main.w / 2.0,
-                main.y + main.h / 2.0,
-                1.03,
-                1.0,
-                WHITE,
-                false
-            );
-
-
-            super::finish_hdr_scene(&mut self.hdr_frame, ui.viewport, output);
-            return Ok(());
-        }
 
         let dx = if now > self.finish_time {
             let p = ((now - self.finish_time) / TRANSITION_TIME).min(1.);
