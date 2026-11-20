@@ -7,6 +7,75 @@ use std::cell::{Cell, RefCell};
 
 const SAIRA_FONT: &[u8] = include_bytes!("../../assets/fonts/Saira-SemiBold.ttf");
 
+/// Source-over blit for associated SDR render-target RGB. Do not use for HDR
+/// mapped layers: map_hdr deliberately outputs straight RGB for SrcAlpha draws.
+/// Own the material per GPU context, rather than caching a handle across exports.
+pub struct PremultipliedBlit(Material);
+
+impl PremultipliedBlit {
+    pub fn new() -> Result<Self> {
+        use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation, PipelineParams};
+        let source_over = BlendState::new(
+            Equation::Add,
+            BlendFactor::One,
+            BlendFactor::OneMinusValue(BlendValue::SourceAlpha),
+        );
+        Ok(Self(load_material(
+            PREMULTIPLIED_VERTEX,
+            PREMULTIPLIED_FRAGMENT,
+            MaterialParams {
+                pipeline_params: PipelineParams {
+                    color_blend: Some(source_over),
+                    alpha_blend: Some(source_over),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )?))
+    }
+
+    pub fn draw(&self, texture: Texture2D, x: f32, y: f32, tint: Color, params: DrawTextureParams) {
+        gl_use_material(self.0);
+        draw_texture_ex(texture, x, y, tint, params);
+        // QuadGl queues pipeline handles, not owned materials. Submit this blit
+        // before it can be dropped on a subsequent render error; never flush
+        // from Drop during error unwinding or after GPU teardown.
+        unsafe { get_internal_gl() }.flush();
+        gl_use_default_material();
+    }
+}
+
+impl Drop for PremultipliedBlit {
+    fn drop(&mut self) {
+        self.0.delete();
+    }
+}
+
+const PREMULTIPLIED_VERTEX: &str = r#"#version 450 core
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec2 texcoord;
+layout(location = 2) in uvec4 color0;
+layout(set = 0, binding = 0) uniform Uniforms { mat4 Projection; mat4 Model; vec4 _Time; };
+layout(location = 0) out vec2 uv;
+layout(location = 1) out vec4 tint;
+void main() {
+    gl_Position = Projection * Model * vec4(position, 1.0);
+    uv = texcoord;
+    tint = vec4(color0) / 255.0;
+}
+"#;
+
+const PREMULTIPLIED_FRAGMENT: &str = r#"#version 450 core
+layout(location = 0) in vec2 uv;
+layout(location = 1) in vec4 tint;
+layout(set = 0, binding = 1) uniform sampler2D Texture;
+layout(location = 0) out vec4 fragColor;
+void main() {
+    vec4 src = texture(Texture, uv);
+    fragColor = vec4(src.rgb * tint.rgb * tint.a, src.a * tint.a);
+}
+"#;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct RhythmFrameSample {
     time: Option<f32>,
@@ -34,6 +103,7 @@ pub struct RhythmComposite {
     frame_sample: Cell<RhythmFrameSample>,
     preserve_alpha: bool,
     hdr: bool,
+    premultiplied_blit: Option<PremultipliedBlit>,
 }
 
 impl RhythmComposite {
@@ -104,6 +174,11 @@ impl RhythmComposite {
         } else {
             Vec::new()
         };
+        let premultiplied_blit = if strip.is_some() && preserve_alpha && !hdr {
+            Some(PremultipliedBlit::new()?)
+        } else {
+            None
+        };
         Ok(Self {
             layout,
             strip,
@@ -112,6 +187,7 @@ impl RhythmComposite {
             frame_sample: Cell::new(RhythmFrameSample::default()),
             preserve_alpha,
             hdr,
+            premultiplied_blit,
         })
     }
 
@@ -147,28 +223,24 @@ impl RhythmComposite {
         camera.render_target = Some(output_target.input());
         set_camera(&camera);
         clear_background(if self.preserve_alpha { Color::new(0., 0., 0., 0.) } else { BLACK });
-        draw_texture_ex(
-            game.output().texture,
-            0.,
-            0.,
-            WHITE,
-            DrawTextureParams {
-                dest_size: Some(vec2(width, game_height)),
+        // SDR alpha game targets are associated; copying them with SrcAlpha
+        // would multiply coverage twice. The opaque strip is compatible too.
+        // HDR mapped textures remain straight and keep the default material.
+        for (texture, y, height) in [
+            (game.output().texture, 0., game_height),
+            (strip_target.output().texture, game_height, self.layout.strip_height as f32),
+        ] {
+            let params = DrawTextureParams {
+                dest_size: Some(vec2(width, height)),
                 flip_y: true,
                 ..Default::default()
-            },
-        );
-        draw_texture_ex(
-            strip_target.output().texture,
-            0.,
-            game_height,
-            WHITE,
-            DrawTextureParams {
-                dest_size: Some(vec2(width, self.layout.strip_height as f32)),
-                flip_y: true,
-                ..Default::default()
-            },
-        );
+            };
+            if let Some(blit) = &self.premultiplied_blit {
+                blit.draw(texture, 0., y, WHITE, params);
+            } else {
+                draw_texture_ex(texture, 0., y, WHITE, params);
+            }
+        }
         unsafe { get_internal_gl() }.flush();
         pop_camera_state();
         output_target.output()

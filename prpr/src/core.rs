@@ -50,7 +50,7 @@ pub use render::{begin_readback_cycle, MSRenderTarget};
 pub use crate::config::{hdr_map_channel, hdr_map_srgb};
 
 mod rhythm_composite;
-pub use rhythm_composite::RhythmComposite;
+pub use rhythm_composite::{PremultipliedBlit, RhythmComposite};
 
 mod resource;
 pub use resource::{NoteStyle, ParticleEmitter, ResPackInfo, Resource, ResourcePack, DPI_VALUE};

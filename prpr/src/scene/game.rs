@@ -351,6 +351,7 @@ pub struct GameScene {
     rhythm_strip: Option<RhythmStrip>,
     rhythm_painter: Option<TextPainter>,
     hdr_rhythm_frame: Option<crate::core::MSRenderTarget>,
+    premultiplied_blit: Option<crate::core::PremultipliedBlit>,
 
     state: State,
     pub last_update_time: f64,
@@ -712,6 +713,13 @@ impl GameScene {
             JudgementCounter::new(NoteType::Hold, chart_ratio, 0.0),
         ];
         let target_chart_ratio = config.chart_ratio;
+        // Transparent SDR chart passes resolve to associated RGB. HDR's mapped
+        // layers are straight RGB and must retain their existing SrcAlpha blits.
+        let premultiplied_blit = if res.config.transparent_background && !res.config.hdr_output {
+            Some(crate::core::PremultipliedBlit::new()?)
+        } else {
+            None
+        };
 
         Ok(Self {
             should_exit: false,
@@ -736,6 +744,7 @@ impl GameScene {
             rhythm_strip,
             rhythm_painter,
             hdr_rhythm_frame: None,
+            premultiplied_blit,
 
             state: State::Starting,
             last_update_time: 0.,
@@ -2197,16 +2206,15 @@ impl Scene for GameScene {
                         clear_background(BLANK);
                     }
                     let source_texture = hdr_scene_texture.unwrap_or(target.output().texture);
-                    draw_texture_ex(
-                        source_texture,
-                        -1.,
-                        -ui.top,
-                        WHITE,
-                        DrawTextureParams {
-                            dest_size: Some(vec2(2., ui.top * 2.)),
-                            ..Default::default()
-                        },
-                    );
+                    let params = DrawTextureParams {
+                        dest_size: Some(vec2(2., ui.top * 2.)),
+                        ..Default::default()
+                    };
+                    if let Some(blit) = &self.premultiplied_blit {
+                        blit.draw(source_texture, -1., -ui.top, WHITE, params);
+                    } else {
+                        draw_texture_ex(source_texture, -1., -ui.top, WHITE, params);
+                    }
                 }
 
                 // 噪域 (`blockAreaList`) runs as a post pass over the resolved
