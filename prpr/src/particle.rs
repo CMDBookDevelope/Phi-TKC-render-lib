@@ -408,6 +408,7 @@ struct CpuParticle {
 
 pub struct Emitter {
     pipeline: Pipeline,
+    layer_pipeline: Pipeline,
     bindings: Bindings,
     post_processing_pass: RenderPass,
     post_processing_pipeline: Pipeline,
@@ -466,35 +467,33 @@ impl Emitter {
         };
 
         let blend_mode = config.blend_mode.blend_state();
-        let pipeline = Pipeline::with_params(
-            ctx,
-            &[
-                BufferLayout::default(),
-                BufferLayout {
-                    step_func: VertexStep::PerInstance,
-                    ..Default::default()
-                },
-            ],
-            &[
-                VertexAttribute::with_buffer("in_attr_pos", VertexFormat::Float3, 0),
-                VertexAttribute::with_buffer("in_attr_uv", VertexFormat::Float2, 0),
-                VertexAttribute::with_buffer("in_attr_color", VertexFormat::Float4, 0),
-                VertexAttribute::with_buffer("in_attr_inst_pos", VertexFormat::Float4, 1),
-                VertexAttribute::with_buffer("in_attr_inst_uv", VertexFormat::Float4, 1),
-                VertexAttribute::with_buffer("in_attr_inst_data", VertexFormat::Float4, 1),
-                VertexAttribute::with_buffer("in_attr_inst_color", VertexFormat::Float4, 1),
-            ],
-            shader,
-            PipelineParams {
+        let layout = [
+            BufferLayout::default(),
+            BufferLayout { step_func: VertexStep::PerInstance, ..Default::default() },
+        ];
+        let attributes = [
+            VertexAttribute::with_buffer("in_attr_pos", VertexFormat::Float3, 0),
+            VertexAttribute::with_buffer("in_attr_uv", VertexFormat::Float2, 0),
+            VertexAttribute::with_buffer("in_attr_color", VertexFormat::Float4, 0),
+            VertexAttribute::with_buffer("in_attr_inst_pos", VertexFormat::Float4, 1),
+            VertexAttribute::with_buffer("in_attr_inst_uv", VertexFormat::Float4, 1),
+            VertexAttribute::with_buffer("in_attr_inst_data", VertexFormat::Float4, 1),
+            VertexAttribute::with_buffer("in_attr_inst_color", VertexFormat::Float4, 1),
+        ];
+        let mut make_pipeline = |alpha_blend| {
+            Pipeline::with_params(ctx, &layout, &attributes, shader, PipelineParams {
                 color_blend: Some(blend_mode),
-                alpha_blend: Some(BlendState::new(
-                    Equation::Add,
-                    BlendFactor::Zero,
-                    BlendFactor::One,
-                )),
+                alpha_blend: Some(alpha_blend),
                 ..Default::default()
-            },
-        );
+            })
+        };
+        let pipeline = make_pipeline(BlendState::new(Equation::Add, BlendFactor::Zero, BlendFactor::One));
+        // A transparent layer needs source-over coverage alongside its RGB.
+        let layer_pipeline = make_pipeline(BlendState::new(
+            Equation::Add,
+            BlendFactor::One,
+            BlendFactor::OneMinusValue(BlendValue::SourceAlpha),
+        ));
 
         let post_processing_shader = Shader::new(
             ctx,
@@ -565,6 +564,7 @@ impl Emitter {
             post_processing_bindings,
             config,
             pipeline,
+            layer_pipeline,
             bindings,
             position: vec2(0.0, 0.0),
             gpu_particles: Vec::with_capacity(Self::MAX_PARTICLES),
@@ -773,9 +773,14 @@ impl Emitter {
     }
 
     pub fn setup_render_pass(&mut self, quad_gl: &QuadGl, ctx: &mut Context) {
+        self.setup_render_pass_impl(quad_gl, ctx, false);
+    }
+
+    fn setup_render_pass_impl(&mut self, quad_gl: &QuadGl, ctx: &mut Context, write_alpha: bool) {
         if self.config.blend_mode != self.blend_mode {
-            self.pipeline
-                .set_blend(ctx, Some(self.config.blend_mode.blend_state()));
+            let color_blend = Some(self.config.blend_mode.blend_state());
+            self.pipeline.set_blend(ctx, color_blend);
+            self.layer_pipeline.set_blend(ctx, color_blend);
             self.blend_mode = self.config.blend_mode;
         }
 
@@ -792,7 +797,7 @@ impl Emitter {
             );
         }
 
-        ctx.apply_pipeline(&self.pipeline);
+        ctx.apply_pipeline(if write_alpha { &self.layer_pipeline } else { &self.pipeline });
         let (x, y, w, h) = quad_gl
             .get_viewport()
             .unwrap_or_else(|| (0, 0, screen_width() as _, screen_height() as _));
@@ -820,6 +825,15 @@ impl Emitter {
     }
 
     pub fn draw(&mut self, pos: Vec2, dt: f32) {
+        self.draw_impl(pos, dt, false);
+    }
+
+    /// Draw with source-over alpha for a layer that will be composited later.
+    pub fn draw_to_layer(&mut self, pos: Vec2, dt: f32) {
+        self.draw_impl(pos, dt, true);
+    }
+
+    fn draw_impl(&mut self, pos: Vec2, dt: f32, write_alpha: bool) {
         let mut gl = unsafe { get_internal_gl() };
         gl.flush();
         let InternalGlContext { quad_context: ctx, quad_gl } = gl;
@@ -829,7 +843,7 @@ impl Emitter {
 
         if self.gpu_particles.is_empty() { return; }
 
-        self.setup_render_pass(quad_gl, ctx);
+        self.setup_render_pass_impl(quad_gl, ctx, write_alpha);
         self.perform_render_pass(quad_gl, ctx);
         self.end_render_pass(quad_gl, ctx);
     }

@@ -337,6 +337,11 @@ impl ParticleEmitter {
         self.emitter_square.draw(vec2(0., 0.), dt);
     }
 
+    pub(crate) fn draw_to_layer(&mut self, dt: f32) {
+        self.emitter.draw_to_layer(Vec2::ZERO, dt);
+        self.emitter_square.draw_to_layer(Vec2::ZERO, dt);
+    }
+
     pub fn set_scale(&mut self, scale: f32) {
         self.emitter.config.size = self.scale * scale / 5.;
         self.emitter_square.config.size = self.scale * scale / 44.;

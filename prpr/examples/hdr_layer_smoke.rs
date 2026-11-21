@@ -57,6 +57,44 @@ fn main() {
         assert_eq!(&bytes[..8], &[0; 8]);
         assert_ne!(&bytes[center..center+8], &[0; 8]);
         println!("Mapped only procedural coverage and changed RPE-style pixels");
+        {
+            use prpr::particle::{Emitter, EmitterConfig};
+            let mut hit = MSRenderTarget::new_hdr(size, 1);
+            set_camera(&Camera2D {
+                zoom: vec2(1., -1.),
+                viewport: Some((16, 0, 96, 128)),
+                render_target: Some(hit.input()),
+                ..Default::default()
+            });
+            clear_background(BLANK);
+            let mut emitter = Emitter::new(EmitterConfig {
+                emitting: false,
+                initial_velocity: 0.,
+                size: 0.2,
+                base_color: Color::new(1., 1., 1., 0.5),
+                ..Default::default()
+            });
+            emitter.emit(vec2(0.5, 0.), 1);
+            emitter.draw_to_layer(Vec2::ZERO, 0.);
+            hit.map_hdr(&settings);
+            read(&hit, &mut bytes);
+            let px = (64 * 128 + 88) * 8;
+            let half = |bytes: &[u8], i| u16::from_ne_bytes([bytes[i], bytes[i + 1]]);
+            assert!(half(&bytes, px).abs_diff(0x4900) <= 2 && half(&bytes, px + 6) == 0x3800);
+            assert_eq!(&bytes[..8], &[0; 8]);
+
+            set_camera(&Camera2D { zoom: vec2(1., 1.), render_target: Some(base.input()), ..Default::default() });
+            clear_background(BLACK);
+            draw_texture_ex(hit.output().texture, -1., -1., WHITE, DrawTextureParams {
+                dest_size: Some(vec2(2., 2.)),
+                ..Default::default()
+            });
+            unsafe { get_internal_gl() }.flush();
+            read(&base, &mut bytes);
+            assert!(half(&bytes, px).abs_diff(0x4500) <= 2 && half(&bytes, px + 6) == 0x3c00);
+            assert_eq!(&bytes[..6], &[0; 6]);
+            println!("Composited a half-opacity hit particle at 500 nits: {:04x}", half(&bytes, px));
+        }
         std::process::exit(0);
     });
 }

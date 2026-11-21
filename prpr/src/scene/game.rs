@@ -2069,7 +2069,7 @@ impl Scene for GameScene {
                 self.bad_notes.retain(|dummy| dummy.render(res));
                 res.note_buffer.borrow_mut().draw_all();
                 if res.config.particle {
-                    res.emitter.draw(dt);
+                    res.emitter.draw_to_layer(dt);
                 }
             } else {
                 self.bad_notes.clear();
@@ -2152,6 +2152,14 @@ impl Scene for GameScene {
             let line_target = self.res.hdr_line_target.as_mut().expect("HDR line target");
             line_target.map_hdr(&line_settings);
             let line_texture = line_target.output().texture;
+            if self.res.config.hand_split {
+                // These are fullscreen conversions, not chart draws: the chart
+                // model and camera must not affect either hand's mapping.
+                let hand_settings = &self.res.config.hdr_settings.hand_indicator;
+                for (target, settings) in self.res.hdr_hand_targets.iter_mut().zip([&hand_settings.left, &hand_settings.right]) {
+                    target.as_mut().expect("HDR hand-indicator target").map_hdr(settings);
+                }
+            }
             let background_texture = self.res.background_target.as_ref().expect("HDR background target").output().texture;
             let scene_target = self.res.hdr_scene_target.as_mut().expect("HDR scene target");
             scene_target.begin_frame();
